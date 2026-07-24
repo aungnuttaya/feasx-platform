@@ -1,4 +1,65 @@
 import { useState, useEffect, useRef, useMemo } from "react";
+import { createClient } from "@supabase/supabase-js";
+
+/* ── Supabase client ──
+   NOTE: SUPABASE_ANON_KEY below is the public "anon"/"publishable" key —
+   it is safe to ship in client code (that's what it's for), unlike a
+   service_role key which must never appear in frontend code. For a
+   real deployment, prefer reading these from env vars instead of
+   hardcoding (Next.js: process.env.NEXT_PUBLIC_SUPABASE_URL /
+   process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY) so switching between
+   dev/prod projects doesn't require editing this file. */
+const SUPABASE_URL = "https://godxkfidqwianrplmolx.supabase.co";
+const SUPABASE_ANON_KEY = "sb_publishable_unnfdsuCvZSg3QNSmJJgGw_6vRfwP5s";
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+/* ── Auth hook — tracks the current Supabase session and exposes
+   sign-in (magic link / OTP email, no password to manage) and
+   sign-out. Falls back to null (logged out) if anything fails, so
+   the rest of the app can keep working in "browse as guest" mode. ── */
+function useSupabaseAuth() {
+  const [user, setUser] = useState(null);
+  const [authLoading, setAuthLoading] = useState(true);
+
+  useEffect(() => {
+    let active = true;
+    supabase.auth.getSession().then(({ data }) => {
+      if (!active) return;
+      setUser(data?.session?.user ?? null);
+      setAuthLoading(false);
+    }).catch(() => { if (active) setAuthLoading(false); });
+
+    const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
+      setUser(session?.user ?? null);
+    });
+    return () => { active = false; sub?.subscription?.unsubscribe?.(); };
+  }, []);
+
+  async function signInWithEmail(email) {
+    const { error } = await supabase.auth.signInWithOtp({
+      email,
+      options: { emailRedirectTo: typeof window !== "undefined" ? window.location.href : undefined },
+    });
+    return { error };
+  }
+
+  async function signOut() { await supabase.auth.signOut(); }
+
+  return { user, authLoading, signInWithEmail, signOut };
+}
+
+/* ── Responsive helper — mobile breakpoint at 720px ── */
+function useIsMobile() {
+  const [isMobile, setIsMobile] = useState(() =>
+    typeof window !== "undefined" ? window.innerWidth <= 720 : false
+  );
+  useEffect(() => {
+    function onResize() { setIsMobile(window.innerWidth <= 720); }
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+  return isMobile;
+}
 
 const C = {
   cream:"#F7F3EC", creamDk:"#EDE6D8", sand:"#D4C5A9",
@@ -11,6 +72,24 @@ const C = {
   inv_bg:"#0D1117", inv_surface:"#161B22", inv_border:"#21262D",
   inv_green:"#00C896", inv_text:"#E6EDF3", inv_muted:"#8B949E", inv_blue:"#58A6FF",
 };
+
+/* ── Subscription Plans — Free/Basic/Plus/Pro, billed monthly via card.
+   Replaces the old one-time credit-pack purchase model. All prices
+   recur every month (cancel anytime); credits refill each billing
+   cycle instead of being bought once and spent down. Numbers below
+   are placeholders carried over from the old one-time price points
+   (฿490/1,990/3,490/4,900) — easy to tune since it's all here. ── */
+const PLANS = [
+  { id:"free",  label:"Free",  price:0,    monthlyCredits:1,   reportsIncluded:0,
+    tagline:"ทดลองใช้งานฟรี", badge:null, popular:false },
+  { id:"basic", label:"Basic", price:990,  monthlyCredits:5,   reportsIncluded:0,
+    tagline:"สำหรับนักลงทุนมือใหม่", badge:null, popular:false },
+  { id:"plus",  label:"Plus",  price:2990, monthlyCredits:15,  reportsIncluded:1,
+    tagline:"รวมรายงาน Premium 1 ฉบับ/เดือน", badge:"⭐ ยอดนิยม", popular:true },
+  { id:"pro",   label:"Pro",   price:4900, monthlyCredits:999, reportsIncluded:999,
+    tagline:"ไม่จำกัดเครดิตและรายงาน", badge:"🏆 Unlimited", popular:false },
+];
+function planById(id) { return PLANS.find(p=>p.id===id) || PLANS[0]; }
 
 /* ── ENGINE L1: Unit Parser ── */
 function parseLandSize(raw) {
@@ -630,8 +709,10 @@ function GlobalStyles() {
     const s = document.createElement("style");
     s.textContent = `
       *{box-sizing:border-box;margin:0;padding:0;}
-      body{font-family:'Noto Sans Thai','Sarabun',sans-serif;background:#F7F3EC;}
+      html,body{overflow-x:hidden;max-width:100%;}
+      body{font-family:'Noto Sans Thai','Sarabun',sans-serif;background:#F7F3EC;position:relative;}
       @keyframes slideUp{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:translateY(0)}}
+      @keyframes sheetUp{from{opacity:0;transform:translateY(100%)}to{opacity:1;transform:translateY(0)}}
       @keyframes fadeUp{from{opacity:0;transform:translateX(-50%) translateY(14px)}to{opacity:1;transform:translateX(-50%) translateY(0)}}
       @keyframes tabFade{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
       @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
@@ -661,14 +742,105 @@ function Toast({ msg }) {
   );
 }
 
-/* ── Overlay ── */
-function Overlay({ onClose, children }) {
+/* ── Overlay ──
+   Desktop: centered modal.
+   Mobile (≤720px): bottom sheet that slides up from the bottom edge,
+   full-width, rounded top corners only, internally scrollable —
+   avoids the flicker/overflow that came from a fixed-width centered
+   modal being squeezed into a narrow viewport. */
+function Overlay({ onClose, children, sheetOnMobile = true }) {
+  const isMobile = useIsMobile();
+  const asSheet = isMobile && sheetOnMobile;
   return (
     <div onClick={e => e.target === e.currentTarget && onClose()}
-      style={{position:"fixed",inset:0,background:"rgba(10,8,6,.65)",backdropFilter:"blur(6px)",
-        zIndex:300,display:"flex",alignItems:"center",justifyContent:"center",padding:20}}>
-      {children}
+      style={{
+        position:"fixed", inset:0, background:"rgba(10,8,6,.65)",
+        backdropFilter:"blur(6px)", WebkitBackdropFilter:"blur(6px)",
+        zIndex:300, display:"flex",
+        alignItems: asSheet ? "flex-end" : "center",
+        justifyContent:"center",
+        padding: asSheet ? 0 : 20,
+        boxSizing:"border-box",
+      }}>
+      <div style={{
+        width:"100%",
+        display:"flex", justifyContent:"center",
+        animation: asSheet ? "sheetUp .28s ease" : "slideUp .28s ease",
+      }}>
+        {children}
+      </div>
     </div>
+  );
+}
+
+/* ── Auth Modal — email magic-link / OTP sign-in.
+   No password to store or reset; Supabase emails a one-time link. ── */
+function AuthModal({ onClose, onSignIn }) {
+  const [email, setEmail] = useState("");
+  const [sent, setSent] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+
+  async function submit() {
+    if (!email.trim() || !email.includes("@")) { setErr("กรุณาใส่อีเมลให้ถูกต้อง"); return; }
+    setErr(""); setBusy(true);
+    const { error } = await onSignIn(email.trim());
+    setBusy(false);
+    if (error) { setErr(error.message || "ส่งลิงก์ไม่สำเร็จ ลองใหม่อีกครั้ง"); return; }
+    setSent(true);
+  }
+
+  return (
+    <Overlay onClose={onClose}>
+      <div style={{
+        position:"relative", background:C.white, borderRadius:18,
+        maxWidth:380, width:"100%", padding:"28px 24px",
+        boxShadow:"0 24px 64px rgba(44,36,22,.26)", animation:"slideUp .28s ease",
+      }}>
+        <button onClick={onClose} style={{position:"absolute",top:12,right:12,
+          background:C.creamDk,border:"none",borderRadius:"50%",
+          width:28,height:28,fontSize:14,cursor:"pointer",color:C.barkLt}}>✕</button>
+
+        {sent ? (
+          <div style={{textAlign:"center"}}>
+            <div style={{fontSize:32,marginBottom:10}}>📩</div>
+            <div style={{fontFamily:"Georgia,serif",fontSize:17,fontWeight:700,color:C.bark,marginBottom:8}}>
+              ส่งลิงก์เข้าสู่ระบบแล้ว
+            </div>
+            <div style={{fontSize:13,color:C.barkLt,lineHeight:1.7}}>
+              เช็คอีเมล <strong style={{color:C.bark}}>{email}</strong> แล้วกดลิงก์เพื่อเข้าสู่ระบบ
+              (ไม่ต้องตั้งรหัสผ่าน)
+            </div>
+          </div>
+        ) : (
+          <>
+            <div style={{fontSize:26,marginBottom:8}}>🔐</div>
+            <div style={{fontFamily:"Georgia,serif",fontSize:18,fontWeight:700,color:C.bark,marginBottom:6}}>
+              เข้าสู่ระบบ FeasX
+            </div>
+            <div style={{fontSize:13,color:C.barkLt,marginBottom:16,lineHeight:1.7}}>
+              ใส่อีเมล — เราจะส่งลิงก์เข้าสู่ระบบให้ ไม่ต้องจำรหัสผ่าน
+            </div>
+            <input
+              value={email}
+              onChange={e=>setEmail(e.target.value)}
+              onKeyDown={e=>e.key==="Enter" && submit()}
+              placeholder="you@email.com"
+              style={{width:"100%",padding:"11px 14px",border:`1px solid ${err?C.danger:C.sand}`,
+                borderRadius:9,fontSize:14,color:C.bark,background:C.cream,marginBottom:6}}
+            />
+            {err && <div style={{fontSize:12,color:C.danger,marginBottom:8}}>⚠ {err}</div>}
+            <button onClick={submit} disabled={busy} style={{
+              width:"100%",marginTop:8,padding:"12px",border:"none",borderRadius:9,
+              background: busy ? C.mist : `linear-gradient(135deg,${C.forest},${C.forestLt})`,
+              color:C.white,fontSize:14,fontWeight:700,cursor:busy?"default":"pointer",
+            }}>
+              {busy ? "กำลังส่ง..." : "ส่งลิงก์เข้าสู่ระบบ →"}
+            </button>
+          </>
+        )}
+      </div>
+    </Overlay>
   );
 }
 
@@ -743,9 +915,16 @@ function StepperBar({ current }) {
   );
 }
 
-/* ── Navbar v3 — 4 เมนู + Credit + เติมเครดิต ── */
+/* ── Navbar v3 — 4 เมนู + Credit + เติมเครดิต ──
+   Desktop: logo · tabs · credit badge + topup + login, all in one row.
+   Mobile (≤720px): logo · compact credit badge · hamburger. Tapping the
+   hamburger drops a full-width panel with the nav tabs + topup + login,
+   instead of squeezing everything into one 58px-tall row. */
 function Navbar({ screen, credits, onGoHome, onGoIntake, onGoEngine,
-                  onGoReport, onGoActivity, onOpenCredits, onToast }) {
+                  onGoReport, onGoActivity, onOpenCredits, onToast,
+                  user, onOpenAuth, onSignOut }) {
+  const isMobile = useIsMobile();
+  const [menuOpen, setMenuOpen] = useState(false);
   const MENUS = [
     { id:"l1",       label:"🏠 หน้าหลัก" },
     { id:"intake",   label:"📄 นำเข้าที่ดิน" },
@@ -757,6 +936,97 @@ function Navbar({ screen, credits, onGoHome, onGoIntake, onGoEngine,
 
   const showStepper = ["intake","engine","report"].includes(screen);
 
+  function go(id) { handlers[id](); setMenuOpen(false); }
+
+  const Logo = (
+    <div style={{display:"flex",alignItems:"center",gap:10,cursor:"pointer"}}
+      onClick={onGoHome}>
+      <div style={{width:32,height:32,background:C.bark,borderRadius:8,
+        display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>
+        <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
+          <line x1="2" y1="16" x2="16" y2="2" stroke="#C9A96E" strokeWidth="2.5" strokeLinecap="round"/>
+          <line x1="2" y1="2" x2="16" y2="16" stroke="#4E8A65" strokeWidth="2.5" strokeLinecap="round"/>
+          <circle cx="16" cy="2" r="2" fill="#C9A96E"/>
+          <circle cx="9" cy="9" r="1.5" fill="#F7F3EC"/>
+        </svg>
+      </div>
+      <div>
+        <div style={{fontFamily:"'Georgia',serif",fontWeight:700,fontSize:17,
+          color:C.bark,letterSpacing:".02em"}}>
+          Feas<span style={{color:C.forest}}>X</span>
+        </div>
+        {!isMobile && (
+          <div style={{fontSize:9,color:C.amber,letterSpacing:".14em",
+            textTransform:"uppercase",marginTop:-2}}>
+            Smart Feasibility
+          </div>
+        )}
+      </div>
+    </div>
+  );
+
+  if (isMobile) {
+    return (
+      <>
+        <nav style={{
+          display:"flex", alignItems:"center", justifyContent:"space-between",
+          padding:"0 14px", height:54, background:C.white,
+          borderBottom:`1px solid ${C.sand}`,
+          position:"sticky", top:0, zIndex:200, gap:8,
+        }}>
+          {Logo}
+          <div style={{display:"flex",alignItems:"center",gap:6,flexShrink:0}}>
+            <CreditBadge credits={credits} onClick={onOpenCredits}/>
+            <button onClick={()=>setMenuOpen(o=>!o)} aria-label="เมนู" style={{
+              width:36, height:36, borderRadius:9, border:`1px solid ${C.sand}`,
+              background: menuOpen ? C.creamDk : "transparent",
+              display:"flex", alignItems:"center", justifyContent:"center",
+              fontSize:16, cursor:"pointer", flexShrink:0,
+            }}>{menuOpen ? "✕" : "☰"}</button>
+          </div>
+        </nav>
+
+        {menuOpen && (
+          <div onClick={()=>setMenuOpen(false)} style={{
+            position:"fixed", inset:0, top:54, background:"rgba(10,8,6,.4)",
+            zIndex:199,
+          }}>
+            <div onClick={e=>e.stopPropagation()} style={{
+              background:C.white, borderBottom:`1px solid ${C.sand}`,
+              padding:"10px 14px 14px", boxShadow:"0 12px 30px rgba(44,36,22,.15)",
+              display:"flex", flexDirection:"column", gap:4,
+            }}>
+              {MENUS.map(m => {
+                const active = screen === m.id;
+                return (
+                  <button key={m.id} onClick={()=>go(m.id)} style={{
+                    textAlign:"left", padding:"11px 12px", borderRadius:9, border:"none",
+                    fontSize:14, fontWeight: active ? 700 : 400,
+                    background: active ? C.creamDk : "transparent",
+                    color: active ? C.bark : C.barkLt, cursor:"pointer",
+                  }}>{m.label}</button>
+                );
+              })}
+              <div style={{height:1,background:C.creamDk,margin:"6px 0"}}/>
+              <button onClick={()=>{onOpenCredits();setMenuOpen(false);}} style={{
+                padding:"11px 12px", background:C.amber, color:C.white,
+                border:"none", borderRadius:9, fontSize:14, fontWeight:700, cursor:"pointer",
+              }}>💳 แผนสมาชิก</button>
+              <button onClick={()=>{user?onSignOut():onOpenAuth();setMenuOpen(false);}} style={{
+                padding:"11px 12px", border:`1px solid ${C.sand}`,
+                borderRadius:9, background:"transparent",
+                color:C.barkLt, fontSize:14, cursor:"pointer",
+                overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap",
+              }}>{user ? `ออกจากระบบ (${user.email})` : "เข้าสู่ระบบ"}</button>
+            </div>
+          </div>
+        )}
+
+        {showStepper && <StepperBar current={screen}/>}
+      </>
+    );
+  }
+
   return (
     <>
       <nav style={{
@@ -765,32 +1035,7 @@ function Navbar({ screen, credits, onGoHome, onGoIntake, onGoEngine,
         borderBottom:`1px solid ${C.sand}`,
         position:"sticky", top:0, zIndex:200,
       }}>
-        {/* Logo */}
-        <div style={{display:"flex",alignItems:"center",gap:10,cursor:"pointer"}}
-          onClick={onGoHome}>
-          <div style={{width:32,height:32,background:C.bark,borderRadius:8,
-            display:"flex",alignItems:"center",justifyContent:"center"}}>
-            <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
-              {/* X shape — left-rising arm (graph line) */}
-              <line x1="2" y1="16" x2="16" y2="2" stroke="#C9A96E" strokeWidth="2.5" strokeLinecap="round"/>
-              {/* X shape — right arm (building structure) */}
-              <line x1="2" y1="2" x2="16" y2="16" stroke="#4E8A65" strokeWidth="2.5" strokeLinecap="round"/>
-              {/* Graph dot on top of rising arm */}
-              <circle cx="16" cy="2" r="2" fill="#C9A96E"/>
-              <circle cx="9" cy="9" r="1.5" fill="#F7F3EC"/>
-            </svg>
-          </div>
-          <div>
-            <div style={{fontFamily:"'Georgia',serif",fontWeight:700,fontSize:17,
-              color:C.bark,letterSpacing:".02em"}}>
-              Feas<span style={{color:C.forest}}>X</span>
-            </div>
-            <div style={{fontSize:9,color:C.amber,letterSpacing:".14em",
-              textTransform:"uppercase",marginTop:-2}}>
-              Smart Feasibility
-            </div>
-          </div>
-        </div>
+        {Logo}
 
         {/* Menu tabs */}
         <div style={{display:"flex",gap:2,background:C.creamDk,borderRadius:10,padding:3}}>
@@ -822,14 +1067,15 @@ function Navbar({ screen, credits, onGoHome, onGoIntake, onGoEngine,
           }}
           onMouseEnter={e=>e.currentTarget.style.background=C.amberLt}
           onMouseLeave={e=>e.currentTarget.style.background=C.amber}>
-            + เติมเครดิต
+            💳 แผนสมาชิก
           </button>
-          <button onClick={()=>onToast("กรุณาเข้าสู่ระบบ")} style={{
+          <button onClick={()=>user?onSignOut():onOpenAuth()} style={{
             padding:"6px 14px", border:`1px solid ${C.sand}`,
             borderRadius:8, background:"transparent",
             color:C.barkLt, fontSize:12, cursor:"pointer",
+            maxWidth:180, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap",
           }}>
-            เข้าสู่ระบบ
+            {user ? `👤 ${user.email} · ออกจากระบบ` : "เข้าสู่ระบบ"}
           </button>
         </div>
       </nav>
@@ -843,6 +1089,7 @@ function CreditConfirmModal({ credits, landName, onConfirm, onClose }) {
   return (
     <Overlay onClose={onClose}>
       <div style={{
+        position:"relative",
         background:C.white, borderRadius:16, maxWidth:320, width:"100%",
         padding:"28px 24px", textAlign:"center",
         boxShadow:"0 20px 60px rgba(44,36,22,.24)", animation:"slideUp .25s ease",
@@ -882,19 +1129,21 @@ function CreditConfirmModal({ credits, landName, onConfirm, onClose }) {
 }
 
 /* ── Credit Package Modal ── */
-function CreditPackageModal({ onClose, onBuy }) {
-  const pkgs = [
-    { id:"single",  credits:1,   price:490,  perUnit:490,  label:"ลองใช้",    badge:null,        popular:false, saving:null },
-    { id:"five",    credits:5,   price:1990, perUnit:398,  label:"ยอดนิยม",   badge:"⭐ ยอดนิยม", popular:true,  saving:"ประหยัด ฿460" },
-    { id:"ten",     credits:10,  price:3490, perUnit:349,  label:"คุ้มที่สุด", badge:"🏆 ดีที่สุด", popular:false, saving:"ประหยัด ฿1,410" },
-    { id:"monthly", credits:999, price:1990, perUnit:0,    label:"Pro รายเดือน",badge:"∞ PRO",    popular:false, saving:"Unlimited" },
-  ];
+/* ── Subscription Modal — monthly recurring plans (replaces one-time credit packs).
+   Billed via card through Stripe; statement descriptor shows "FEASX",
+   never a personal name. Cancel anytime, credits refill every cycle. ── */
+function CreditPackageModal({ onClose, onBuy, currentPlanId="free" }) {
+  const isMobile = useIsMobile();
   return (
     <Overlay onClose={onClose}>
       <div style={{
-        background:C.white, borderRadius:20, maxWidth:640, width:"100%",
+        position:"relative",
+        background:C.white,
+        borderRadius: isMobile ? "20px 20px 0 0" : 20,
+        maxWidth:680, width:"100%",
         overflow:"hidden", boxShadow:"0 24px 64px rgba(44,36,22,.26)",
-        animation:"slideUp .28s ease", maxHeight:"90vh", overflowY:"auto",
+        animation: isMobile ? undefined : "slideUp .28s ease",
+        maxHeight:"90vh", overflowY:"auto",
       }}>
         <button onClick={onClose} style={{position:"absolute",top:14,right:14,
           background:C.creamDk,border:"none",borderRadius:"50%",
@@ -903,94 +1152,89 @@ function CreditPackageModal({ onClose, onBuy }) {
         {/* Header */}
         <div style={{background:C.bark,padding:"24px 28px 20px",textAlign:"center"}}>
           <div style={{fontSize:10,fontWeight:700,letterSpacing:".16em",textTransform:"uppercase",
-            color:C.amberLt,marginBottom:8}}>เลือกแพ็กเกจ</div>
+            color:C.amberLt,marginBottom:8}}>เลือกแผนสมัครสมาชิก</div>
           <div style={{fontFamily:"Georgia,serif",fontSize:20,fontWeight:700,color:C.white,marginBottom:4}}>
-            เครดิตวิเคราะห์ที่ดิน
+            FeasX Subscription
           </div>
           <div style={{fontSize:13,color:"rgba(255,255,255,.55)"}}>
-            จ่ายครั้งเดียว ไม่มีรายเดือน · ใช้ได้ไม่มีวันหมดอายุ
+            เรียกเก็บรายเดือนอัตโนมัติผ่านบัตร · ยกเลิกได้ทุกเมื่อ
           </div>
         </div>
 
-        {/* Package grid */}
-        <div style={{padding:"24px",display:"grid",gridTemplateColumns:"repeat(2,1fr)",gap:12}}>
-          {pkgs.map(p => (
-            <div key={p.id} onClick={()=>onBuy(p)} style={{
+        {/* Plan grid */}
+        <div style={{padding:"24px",display:"grid",
+          gridTemplateColumns: isMobile ? "1fr" : "repeat(2,minmax(0,1fr))",
+          gap:12}}>
+          {PLANS.map(p => {
+            const isCurrent = p.id === currentPlanId;
+            return (
+            <div key={p.id} onClick={()=>!isCurrent && onBuy(p)} style={{
               background: p.popular ? C.bark : C.white,
-              border: p.popular ? `2px solid ${C.amber}` : `1px solid ${C.sand}`,
+              border: isCurrent ? `2px solid ${C.forest}` : p.popular ? `2px solid ${C.amber}` : `1px solid ${C.sand}`,
               borderRadius:14, padding:"18px 16px",
-              cursor:"pointer", position:"relative",
+              cursor: isCurrent ? "default" : "pointer", position:"relative",
               transition:"transform .15s, box-shadow .15s",
               boxShadow: p.popular ? "0 6px 24px rgba(44,36,22,.18)" : "none",
+              opacity: isCurrent ? 0.85 : 1,
             }}
-            onMouseEnter={e=>{e.currentTarget.style.transform="translateY(-2px)";
+            onMouseEnter={e=>{ if(isCurrent) return; e.currentTarget.style.transform="translateY(-2px)";
               e.currentTarget.style.boxShadow="0 8px 28px rgba(44,36,22,.16)";}}
-            onMouseLeave={e=>{e.currentTarget.style.transform="none";
+            onMouseLeave={e=>{ if(isCurrent) return; e.currentTarget.style.transform="none";
               e.currentTarget.style.boxShadow=p.popular?"0 6px 24px rgba(44,36,22,.18)":"none";}}>
 
-              {p.badge && (
+              {(p.badge || isCurrent) && (
                 <div style={{
                   position:"absolute",top:-10,left:"50%",transform:"translateX(-50%)",
-                  background:p.badge.includes("PRO")?C.inv_green:p.popular?C.amber:C.forest,
+                  background:isCurrent?C.forest:p.popular?C.amber:C.forest,
                   color:"#fff",fontSize:9,fontWeight:700,letterSpacing:".1em",
                   padding:"3px 12px",borderRadius:20,whiteSpace:"nowrap",
-                }}>{p.badge}</div>
+                }}>{isCurrent ? "✓ แผนปัจจุบัน" : p.badge}</div>
               )}
 
               <div style={{
-                fontFamily:"Georgia,serif",
-                fontSize:p.id==="monthly"?15:26,fontWeight:700,
+                fontFamily:"Georgia,serif", fontSize:20,fontWeight:700,
                 color:p.popular?C.cream:C.bark,
-                marginTop:p.badge?8:0,marginBottom:3,
+                marginTop:(p.badge||isCurrent)?8:0,marginBottom:3,
               }}>
-                {p.id==="monthly"?"ไม่จำกัด":`${p.credits} แปลง`}
+                {p.label}
               </div>
 
-              <div style={{fontSize:10,fontWeight:600,textTransform:"uppercase",
-                letterSpacing:".1em",color:p.popular?C.amberLt:C.amber,marginBottom:10}}>
-                {p.label}
+              <div style={{fontSize:11,color:p.popular?"rgba(255,255,255,.6)":C.barkLt,marginBottom:10,lineHeight:1.5}}>
+                {p.tagline}
               </div>
 
               <div style={{fontFamily:"monospace",fontSize:22,fontWeight:700,
                 color:p.popular?C.white:C.forest,marginBottom:3}}>
-                ฿{p.price.toLocaleString()}
-                {p.id==="monthly"&&<span style={{fontSize:11,fontWeight:400,
-                  color:p.popular?"rgba(255,255,255,.5)":C.mist}}>/เดือน</span>}
+                {p.price===0 ? "฿0" : `฿${p.price.toLocaleString()}`}
+                <span style={{fontSize:11,fontWeight:400,
+                  color:p.popular?"rgba(255,255,255,.5)":C.mist}}>/เดือน</span>
               </div>
 
-              {p.perUnit>0 && (
-                <div style={{fontSize:11,color:p.popular?"rgba(255,255,255,.5)":C.mist,marginBottom:8}}>
-                  ฿{p.perUnit}/แปลง
-                </div>
-              )}
-
-              {p.saving && (
-                <div style={{
-                  fontSize:11,fontWeight:600,
-                  color:p.popular?C.amberLt:C.forest,
-                  background:p.popular?"rgba(255,255,255,.08)":"#EAF2EC",
-                  borderRadius:6,padding:"3px 8px",
-                  display:"inline-block",marginBottom:10,
-                }}>✓ {p.saving}</div>
-              )}
+              <div style={{fontSize:11,color:p.popular?"rgba(255,255,255,.5)":C.mist,marginBottom:10}}>
+                {p.monthlyCredits>=999 ? "เครดิตไม่จำกัด" : `${p.monthlyCredits} เครดิต/เดือน`}
+                {p.reportsIncluded>0 && (p.reportsIncluded>=999
+                  ? " · รายงาน Premium ไม่จำกัด"
+                  : ` · รายงาน Premium ${p.reportsIncluded}/เดือน`)}
+              </div>
 
               <div style={{
                 width:"100%",padding:"9px 0",
-                background:p.popular
+                background: isCurrent ? "transparent" : p.popular
                   ?`linear-gradient(135deg,${C.amber},${C.amberLt})`
                   :C.creamDk,
+                border: isCurrent ? `1px solid ${p.popular?"rgba(255,255,255,.3)":C.sand}` : "none",
                 borderRadius:8,fontSize:12,fontWeight:700,
-                color:p.popular?C.bark:C.barkLt,
+                color: isCurrent ? (p.popular?C.white:C.barkLt) : p.popular?C.bark:C.barkLt,
                 textAlign:"center",marginTop:8,
               }}>
-                {p.id==="monthly"?"เริ่ม Pro →":"เลือกแพ็กนี้ →"}
+                {isCurrent ? "ใช้งานอยู่" : p.price===0 ? "เริ่มใช้ฟรี →" : "สมัครแผนนี้ →"}
               </div>
             </div>
-          ))}
+          );})}
         </div>
 
         <div style={{textAlign:"center",padding:"0 24px 20px",fontSize:12,color:C.mist}}>
-          🔐 ชำระผ่าน PromptPay / บัตรเครดิต · ปลอดภัย 100%
+          🔐 เรียกเก็บผ่านบัตรเครดิต/เดบิต (Stripe) · ใบแจ้งหนี้ขึ้นชื่อ "FEASX" ไม่ใช่ชื่อบุคคล · ยกเลิกได้ทุกเมื่อ
         </div>
       </div>
     </Overlay>
@@ -1135,7 +1379,7 @@ function ResultCard({ land, onUnlock, onToast }) {
 
   function handleReveal() {
     if (isFeatured) setRevealed(true);
-    else onUnlock();
+    else onUnlock(String(land.id ?? land.title ?? land.deed_no ?? "unknown"));
   }
 
   return (
@@ -1250,7 +1494,7 @@ function ResultCard({ land, onUnlock, onToast }) {
             <div style={{ position:"absolute",inset:0,display:"flex",alignItems:"center",justifyContent:"center" }}>
               <div style={{ background:"rgba(255,255,255,.94)",borderRadius:10,padding:"7px 14px",
                 fontSize:12,fontWeight:700,color:C.bark,border:`1px solid ${C.sand}` }}>
-                🔒 ดู ROI จริง — ฿490
+                🔒 ดู ROI จริง — ใช้ 1 เครดิต
               </div>
             </div>
           </div>
@@ -1264,7 +1508,7 @@ function ResultCard({ land, onUnlock, onToast }) {
           }}
           onMouseEnter={e=>e.currentTarget.style.transform="translateY(-1px)"}
           onMouseLeave={e=>e.currentTarget.style.transform="none"}>
-            {isOwner ? "ดู ROI วิเคราะห์ — ฟรี →" : isFeatured ? "ดู ROI ฟรี — แปลงตัวอย่าง →" : "ปลดล็อก ROI · ฿490 →"}
+            {isOwner ? "ดู ROI วิเคราะห์ — ฟรี →" : isFeatured ? "ดู ROI ฟรี — แปลงตัวอย่าง →" : "ปลดล็อก ROI · ใช้ 1 เครดิต →"}
           </button>
         ) : (
           <div style={{ display:"flex",flexDirection:"column",gap:8 }}>
@@ -1278,12 +1522,12 @@ function ResultCard({ land, onUnlock, onToast }) {
                 <button onClick={()=>{ onGoReport && onGoReport(); }}
                   style={{ width:"100%",padding:"10px",border:`1px solid ${C.sand}`,borderRadius:9,
                     background:C.cream,color:C.barkLt,fontSize:12,fontWeight:600,cursor:"pointer" }}>
-                  📋 ปรึกษาสถาปนิก + Feasibility Study ฿4,900 →
+                  📋 ปรึกษาสถาปนิก + Feasibility Study (แผน Plus ขึ้นไป) →
                 </button>
               </>
             ) : (
               <div style={{ display:"flex",gap:8 }}>
-                <button onClick={onUnlock} style={{ flex:1,padding:"10px",border:"none",borderRadius:9,background:C.forest,color:C.white,fontSize:12,fontWeight:700,cursor:"pointer" }}>📋 รายงานเต็ม ฿4,900 →</button>
+                <button onClick={onUnlock} style={{ flex:1,padding:"10px",border:"none",borderRadius:9,background:C.forest,color:C.white,fontSize:12,fontWeight:700,cursor:"pointer" }}>📋 รายงานเต็ม (แผน Plus+) →</button>
                 <button onClick={()=>onToast("📞 สิทธิ์สมาชิก Pro")} style={{ padding:"10px 14px",border:`1px solid ${C.sand}`,borderRadius:9,background:C.cream,color:C.barkLt,fontSize:13,cursor:"pointer" }}>📞</button>
               </div>
             )}
@@ -1601,10 +1845,10 @@ function PaywallModal({ onClose, onUnlock }) {
         <div style={{padding:"22px 24px 16px",borderBottom:`1px solid ${C.creamDk}`}}>
           <div style={{fontSize:22,marginBottom:10}}>🔓</div>
           <h2 style={{fontFamily:"Georgia,serif",fontSize:18,fontWeight:700,color:C.bark,marginBottom:6,lineHeight:1.4}}>
-            เริ่มต้นเป็นนักลงทุน<br/><span style={{color:C.amber}}>ด้วย ฿490 เพียงครั้งเดียว</span>
+            เริ่มต้นเป็นนักลงทุน<br/><span style={{color:C.amber}}>ด้วยแผน Basic ฿990/เดือน</span>
           </h2>
           <p style={{fontSize:13,color:C.barkLt,lineHeight:1.75}}>
-            จ่ายครั้งเดียว ค่อยๆ ดู ค่อยๆ เลือก จนพบแปลงที่ใช่
+            สมัครครั้งเดียว ใช้ได้ทุกเดือน ค่อยๆ ดู ค่อยๆ เลือก จนพบแปลงที่ใช่
             แล้วค่อยปรึกษาสถาปนิกขั้นต่อไป
           </p>
         </div>
@@ -1613,14 +1857,10 @@ function PaywallModal({ onClose, onUnlock }) {
           <div style={{background:C.cream,border:`1.5px solid ${C.amber}`,borderRadius:12,padding:"18px",marginBottom:14,position:"relative"}}>
             <div style={{position:"absolute",top:-10,left:14,background:C.amber,color:C.white,
               fontSize:10,fontWeight:700,letterSpacing:".1em",textTransform:"uppercase",padding:"3px 12px",borderRadius:20}}>
-              Investor Pass · 1 แปลง
+              Basic · 5 เครดิต/เดือน
             </div>
-            <div style={{display:"flex",alignItems:"center",gap:10,marginTop:6,marginBottom:4}}>
-              <div style={{fontSize:13,color:C.mist,textDecoration:"line-through",fontFamily:"monospace"}}>฿4,900</div>
-              <div style={{fontSize:10,background:"#FFF0E0",color:C.amber,padding:"2px 8px",borderRadius:20,fontWeight:700}}>ลด 90%</div>
-            </div>
-            <div style={{fontFamily:"monospace",fontSize:28,fontWeight:700,color:C.forest,marginBottom:12}}>
-              ฿490 <span style={{fontSize:12,fontWeight:400,color:C.barkLt}}>/ แปลง</span>
+            <div style={{fontFamily:"monospace",fontSize:28,fontWeight:700,color:C.forest,marginBottom:12,marginTop:6}}>
+              ฿990 <span style={{fontSize:12,fontWeight:400,color:C.barkLt}}>/เดือน</span>
             </div>
             {["ข้อมูล ROI เชิงลึก 3 รูปแบบ",
               "ข้อมูลติดต่อเจ้าของที่ดินโดยตรง",
@@ -1633,7 +1873,7 @@ function PaywallModal({ onClose, onUnlock }) {
           </div>
 
           <div style={{textAlign:"center",fontSize:12,color:C.barkLt,marginBottom:12,lineHeight:1.65}}>
-            💡 ที่ดินมูลค่าหลายล้าน — <strong style={{color:C.bark}}>฿490 เพื่อตัดสินใจได้ถูกต้อง</strong>
+            💡 ที่ดินมูลค่าหลายล้าน — <strong style={{color:C.bark}}>฿990/เดือน เพื่อตัดสินใจได้ถูกต้อง</strong>
           </div>
 
           <button onClick={onUnlock} style={{width:"100%",padding:"14px",
@@ -1643,10 +1883,10 @@ function PaywallModal({ onClose, onUnlock }) {
             boxShadow:"0 4px 16px rgba(61,107,79,.3)",transition:"all .2s"}}
             onMouseEnter={e=>{e.currentTarget.style.transform="translateY(-1px)";e.currentTarget.style.boxShadow="0 6px 24px rgba(61,107,79,.4)"}}
             onMouseLeave={e=>{e.currentTarget.style.transform="none";e.currentTarget.style.boxShadow="0 4px 16px rgba(61,107,79,.3)"}}>
-            เริ่มเป็นนักลงทุน · ฿490 →
+            เริ่มเป็นนักลงทุน · ฿990/เดือน →
           </button>
           <div style={{textAlign:"center",fontSize:11,color:C.mist}}>
-            🔐 PromptPay / บัตรเครดิต · จ่ายครั้งเดียว ไม่มีรายเดือน
+            🔐 เรียกเก็บผ่านบัตร (Stripe) · ยกเลิกได้ทุกเมื่อ · ใบแจ้งหนี้ขึ้นชื่อ FEASX
           </div>
         </div>
       </div>
@@ -1754,6 +1994,7 @@ function Level3({ onGoHome, onToast }) {
 
 /* ════ SMART ENGINE SCREEN ════ */
 function SmartEngine({ onToast }) {
+  const isMobile = useIsMobile();
   const [rows, setRows] = useState(() => SEED.map(r => processRow(r)));
   const [showAdd, setShowAdd] = useState(false);
   const [sel, setSel] = useState(null);
@@ -1856,6 +2097,53 @@ function SmartEngine({ onToast }) {
             ))}
             <div style={{fontSize:11,color:C.mist,marginLeft:"auto"}}>คลิกแถวเพื่อดูรายละเอียด</div>
           </div>
+          {isMobile ? (
+            /* ── Mobile: vertical card list — no horizontal scroll needed.
+               Tap a card to open the same DetailDrawer used on desktop,
+               so AI Summary / GFA / ROI are one tap away instead of a
+               swipe to the right that most people never make. ── */
+            <div style={{display:"flex",flexDirection:"column"}}>
+              {filtered.length===0 && (
+                <div style={{padding:"28px",textAlign:"center",color:C.mist,fontSize:14}}>ไม่พบข้อมูล</div>
+              )}
+              {filtered.map((row,i)=>{
+                const isSel = sel?.id===row.id;
+                return (
+                  <div key={row.id} onClick={()=>setSel(isSel?null:row)} style={{
+                    padding:"12px 14px",
+                    background: isSel ? "#E8F5E9" : i%2===0 ? C.white : C.cream,
+                    borderBottom:`1px solid ${C.creamDk}`, cursor:"pointer",
+                  }}>
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:10,marginBottom:8}}>
+                      <div style={{flex:1,minWidth:0}}>
+                        <div style={{fontWeight:600,color:C.bark,fontSize:13,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{row.title}</div>
+                        <div style={{fontSize:11,color:C.mist,marginTop:2}}>{row.district} · {row.province}</div>
+                      </div>
+                      <button onClick={e=>{e.stopPropagation();delRow(row.id);}}
+                        style={{background:"none",border:"none",color:C.mist,fontSize:14,padding:"2px 6px",borderRadius:4,flexShrink:0}}>✕</button>
+                    </div>
+                    <div style={{display:"flex",gap:8,flexWrap:"wrap",alignItems:"center",marginBottom:8}}>
+                      <ZChip color={row.zoning_color}/>
+                      <span style={{fontFamily:"monospace",fontSize:12,color:C.bark}}>฿{Number(row.price).toLocaleString()}</span>
+                      <span style={{fontSize:11,color:C.mist}}>{row.land_size_wah?.toLocaleString()} ตร.ว.</span>
+                    </div>
+                    <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:6,
+                      background:C.creamDk,borderRadius:8,padding:"8px 10px"}}>
+                      {[["ROI A",row.Type_A_ROI,null],["ROI B",row.Type_B_ROI,null],["ROI C",row.Type_C_ROI,row.Type_C_Block]].map(([l,v,block])=>(
+                        <div key={l} style={{textAlign:"center"}}>
+                          <div style={{fontSize:9,color:C.mist,textTransform:"uppercase",marginBottom:2}}>{l}</div>
+                          <RBadge value={v} block={block}/>
+                        </div>
+                      ))}
+                    </div>
+                    <div style={{textAlign:"center",fontSize:10,color:C.mist,marginTop:6}}>
+                      แตะเพื่อดู AI Summary · GFA · รายละเอียดเต็ม →
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
           <div style={{overflowX:"auto"}}>
             <table style={{width:"100%",borderCollapse:"collapse",minWidth:860}}>
               <thead>
@@ -1913,6 +2201,7 @@ function SmartEngine({ onToast }) {
               </tbody>
             </table>
           </div>
+          )}
           <div style={{padding:"9px 14px",background:C.creamDk,borderTop:`1px solid ${C.sand}`,display:"flex",gap:14,flexWrap:"wrap",fontSize:11,color:C.barkLt}}>
             <span><span style={{color:C.forest,fontWeight:700}}>≥12%</span> ยอดเยี่ยม</span>
             <span><span style={{color:C.amber,fontWeight:700}}>7-11%</span> ดี</span>
@@ -2019,6 +2308,7 @@ function AddRowModal({ onClose, onAdd }) {
 
 /* ── Detail Drawer ── */
 function DetailDrawer({ row, onClose }) {
+  const isMobile = useIsMobile();
   const TC = {A:{bar:"linear-gradient(90deg,#C9A96E,#E4C28A)",l:"บ้านหรู"},B:{bar:"linear-gradient(90deg,#7BA68A,#A8C5B4)",l:"บ้านเช่า"},C:{bar:"linear-gradient(90deg,#3D6B4F,#5D9270)",l:"อาคาร"}};
   const maxR = Math.max(row.Type_A_ROI||0, row.Type_B_ROI||0, row.Type_C_ROI||0) || 1;
   function ZC({c}) {
@@ -2027,9 +2317,18 @@ function DetailDrawer({ row, onClose }) {
     return <span style={{background:bg,color:tx,fontSize:10,fontWeight:700,padding:"3px 8px",borderRadius:20}}>{c}</span>;
   }
   return (
-    <div style={{position:"fixed",inset:0,zIndex:400,display:"flex"}}>
+    <div style={{position:"fixed",inset:0,zIndex:400,display:"flex",
+      flexDirection: isMobile ? "column-reverse" : "row",
+      alignItems: isMobile ? "stretch" : "stretch"}}>
       <div onClick={onClose} style={{flex:1,background:"rgba(44,36,22,.4)",backdropFilter:"blur(3px)"}}/>
-      <div style={{width:340,background:C.white,height:"100%",overflowY:"auto",boxShadow:"-8px 0 40px rgba(0,0,0,.18)"}}>
+      <div style={{
+        width: isMobile ? "100%" : 340,
+        maxHeight: isMobile ? "85vh" : undefined,
+        borderRadius: isMobile ? "18px 18px 0 0" : 0,
+        background:C.white, height: isMobile ? undefined : "100%",
+        overflowY:"auto",
+        boxShadow: isMobile ? "0 -8px 30px rgba(0,0,0,.18)" : "-8px 0 40px rgba(0,0,0,.18)",
+      }}>
         <div style={{background:"linear-gradient(135deg,#1E3A2A,#2E5C3E)",padding:"18px 18px 14px"}}>
           <button onClick={onClose} style={{float:"right",background:"rgba(255,255,255,.15)",border:"none",borderRadius:6,padding:"4px 10px",color:C.white,fontSize:12}}>✕</button>
           <div style={{fontSize:9,fontWeight:700,letterSpacing:".12em",textTransform:"uppercase",color:"#7CC89A",marginBottom:5}}>Smart Analysis</div>
@@ -2425,10 +2724,10 @@ function LandResultsForBusiness({ bm, onUnlock, onToast, onGoReport }) {
                       background:C.forest,color:C.white,fontSize:12,fontWeight:700,cursor:"pointer"}}>
                     🏗️ สอบถามสถาปนิก — ฟรี
                   </button>
-                  <button onClick={onUnlock}
+                  <button onClick={()=>onUnlock(String(land.id ?? i))}
                     style={{padding:"10px 14px",border:`1px solid ${C.amber}`,borderRadius:9,
                       background:"#FDF5EA",color:C.amber,fontSize:11,fontWeight:700,cursor:"pointer",whiteSpace:"nowrap"}}>
-                    ข้อมูลลึก ฿490
+                    ข้อมูลลึก · 1 เครดิต
                   </button>
                 </div>
               </div>
@@ -2441,7 +2740,7 @@ function LandResultsForBusiness({ bm, onUnlock, onToast, onGoReport }) {
         onClick={onGoReport}>
         <div style={{fontSize:12,color:"rgba(255,255,255,.5)",marginBottom:3}}>อยากได้รายงานเต็มรูปแบบ?</div>
         <div style={{fontSize:14,fontWeight:700,color:C.white}}>
-          ปรึกษาสถาปนิก + Feasibility Study ฿4,900 →
+          ปรึกษาสถาปนิก + Feasibility Study (แผน Plus ขึ้นไป) →
         </div>
       </div>
     </div>
@@ -2450,6 +2749,7 @@ function LandResultsForBusiness({ bm, onUnlock, onToast, onGoReport }) {
 
 /* ══ ACTIVITY ENGINE SCREEN v3 — Business-First ══ */
 function ActivityEngineScreen({ onToast, onOpenPaywall, onGoReport }) {
+  const isMobile = useIsMobile();
   const [selBM, setSelBM] = useState(null);
 
   return (
@@ -2476,7 +2776,9 @@ function ActivityEngineScreen({ onToast, onOpenPaywall, onGoReport }) {
             letterSpacing:".1em",marginBottom:16}}>
             ① เลือกประเภทการลงทุนที่ถนัด
           </div>
-          <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:14}}>
+          <div style={{display:"grid",
+            gridTemplateColumns: isMobile ? "1fr" : "repeat(3,minmax(0,1fr))",
+            gap:14}}>
             {BUSINESS_MODELS.map(bm=>(
               <BusinessCard
                 key={bm.id}
@@ -2527,10 +2829,14 @@ function ActivityEngineScreen({ onToast, onOpenPaywall, onGoReport }) {
    ROOT APP v3 — Credit System + New Nav + No AI Agent
 ════════════════════════════════════════════════════════════ */
 export default function App() {
+  const { user, authLoading, signInWithEmail, signOut } = useSupabaseAuth();
   const [screen, setScreen]   = useState("l1");
   const [modal,  setModal]    = useState(null);
   const [toast,  setToast]    = useState("");
-  const [credits,setCredits]  = useState(3); // จำลอง credit
+  const [plan, setPlan]         = useState("free"); // แผนสมัครสมาชิกปัจจุบัน
+  const [credits,setCredits]    = useState(planById("free").monthlyCredits); // เครดิตคงเหลือในรอบเดือนนี้
+  const [reportsLeft,setReportsLeft] = useState(planById("free").reportsIncluded); // สิทธิ์รายงาน Premium คงเหลือในรอบเดือนนี้
+  const [pendingUnlock, setPendingUnlock] = useState(null); // land_ref กำลังจะใช้เครดิตปลดล็อก
   const [myLands,setMyLands]  = useState([
     { id:1, loc:"อ่อนนุช · วัฒนา",  size:"2-1-40",    price:"฿38M",  roiA:12.4 },
     { id:2, loc:"รัชดา · ห้วยขวาง", size:"3-0-0",     price:"฿72M",  roiA:14.1 },
@@ -2538,27 +2844,100 @@ export default function App() {
 
   function showToast(msg) { setToast(msg); setTimeout(()=>setToast(""),3200); }
 
-  function handleUnlock() {
+  // โหลดแผน/เครดิต/สิทธิ์รายงานจริงจาก Supabase ทันทีที่ล็อกอิน
+  // (ถ้ายังไม่ล็อกอิน ใช้ค่า Free แบบ local เพื่อให้เดินดูแอปได้ก่อน)
+  useEffect(() => {
+    if (!user) {
+      setPlan("free");
+      setCredits(planById("free").monthlyCredits);
+      setReportsLeft(planById("free").reportsIncluded);
+      return;
+    }
+    let active = true;
+    (async () => {
+      const [{ data: sub }, { data: usage }] = await Promise.all([
+        supabase.from("subscriptions").select("plan_id,status").eq("user_id", user.id).maybeSingle(),
+        supabase.from("usage_cycles").select("credits_remaining,reports_remaining").eq("user_id", user.id).maybeSingle(),
+      ]);
+      if (!active) return;
+      setPlan(sub?.plan_id || "free");
+      setCredits(usage?.credits_remaining ?? planById(sub?.plan_id || "free").monthlyCredits);
+      setReportsLeft(usage?.reports_remaining ?? planById(sub?.plan_id || "free").reportsIncluded);
+    })();
+    return () => { active = false; };
+  }, [user]);
+
+  function requireAuth() {
+    if (!user) { setModal("auth"); return false; }
+    return true;
+  }
+
+  function handleUnlock(landRef) {
+    if (!requireAuth()) return;
     if (credits > 0) {
-      // มี credit → แสดง confirm modal
+      // มี credit เหลือในรอบเดือนนี้ → แสดง confirm modal
+      setPendingUnlock(landRef || null);
       setModal("creditConfirm");
     } else {
-      // ไม่มี credit → ไปซื้อ
+      // เครดิตหมด → ชวนอัปเกรดแผน
       setModal("credits");
     }
   }
 
-  function handleCreditConfirm() {
-    setCredits(c => c-1);
+  async function handleCreditConfirm() {
     setModal(null);
+    // Guest/demo fallback (ไม่ควรเกิดขึ้นจริงเพราะ handleUnlock เช็ค requireAuth ไปแล้ว)
+    if (!user) { setCredits(c=>Math.max(0,c-1)); showToast("✓ ใช้ 1 เครดิต — กำลังโหลดข้อมูล..."); setTimeout(()=>setScreen("engine"),700); return; }
+
+    const { data, error } = await supabase.rpc("use_credit", { p_land_ref: pendingUnlock || "unknown" });
+    const row = Array.isArray(data) ? data[0] : data;
+    if (error || !row?.ok) {
+      showToast(row?.message === "no credits left" ? "เครดิตหมด — อัปเกรดแผนเพื่อใช้ต่อ" : "เกิดข้อผิดพลาด ลองใหม่อีกครั้ง");
+      if (row?.message === "no credits left") setModal("credits");
+      return;
+    }
+    setCredits(row.credits_remaining);
     showToast("✓ ใช้ 1 เครดิต — กำลังโหลดข้อมูล...");
     setTimeout(() => setScreen("engine"), 700);
   }
 
-  function handleBuyCredits(pkg) {
-    setModal(null);
-    showToast(`✓ ชำระเงิน ฿${pkg.price.toLocaleString()} สำเร็จ — ได้รับ ${pkg.credits===999?"Unlimited":pkg.credits+" เครดิต"}`);
-    if (pkg.credits !== 999) setCredits(c => c + pkg.credits);
+  // สมัคร/อัปเกรดแผน — เปิด Stripe Checkout จริงถ้ามี stripe_price_id (แผนเสียเงิน)
+  // แผน Free ไม่ต้องผ่าน Stripe เลย เปลี่ยนได้ทันที
+  async function handleSubscribe(planObj) {
+    if (!requireAuth()) return;
+    if (planObj.price === 0) {
+      setModal(null);
+      setPlan(planObj.id);
+      setCredits(planObj.monthlyCredits);
+      setReportsLeft(planObj.reportsIncluded);
+      showToast(`✓ เริ่มใช้แผน ${planObj.label} ฟรีแล้ว`);
+      return;
+    }
+    try {
+      showToast("กำลังไปหน้าชำระเงิน...");
+      const res = await fetch("/api/create-checkout-session", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ planId: planObj.id, userId: user.id, email: user.email }),
+      });
+      const data = await res.json();
+      if (data?.url) { window.location.href = data.url; }
+      else { showToast("สร้างหน้าชำระเงินไม่สำเร็จ ลองใหม่อีกครั้ง"); }
+    } catch (e) {
+      showToast("เชื่อมต่อระบบชำระเงินไม่สำเร็จ — ตรวจสอบว่าตั้งค่า /api/create-checkout-session แล้ว");
+    }
+  }
+
+  async function handleUseReport() {
+    if (!user) { setReportsLeft(r => Math.max(0, r-1)); return true; }
+    const { data, error } = await supabase.rpc("use_report");
+    const row = Array.isArray(data) ? data[0] : data;
+    if (error || !row?.ok) {
+      showToast("สิทธิ์รายงานหมด — อัปเกรดแผนเพื่อสร้างรายงานต่อ");
+      return false;
+    }
+    setReportsLeft(row.reports_remaining);
+    return true;
   }
 
   const goHome     = () => { setScreen("l1");       setModal(null); };
@@ -2581,6 +2960,9 @@ export default function App() {
         onGoActivity={goActivity}
         onOpenCredits={() => setModal("credits")}
         onToast={showToast}
+        user={user}
+        onOpenAuth={() => setModal("auth")}
+        onSignOut={() => { signOut(); showToast("ออกจากระบบแล้ว"); }}
       />
 
       {/* Screens */}
@@ -2597,15 +2979,26 @@ export default function App() {
       {screen==="engine"   && <SmartEngine onToast={showToast} credits={credits} onUseCredit={handleUnlock}/>}
       {screen==="activity" && <ActivityEngineScreen onToast={showToast} onOpenPaywall={handleUnlock} onGoReport={goReport}/>}
       {screen==="intake" && <IntakeScreen onToast={showToast} onNext={goEngine}/>}
-      {screen==="report" && <ReportScreen onToast={showToast}/>}
+      {screen==="report" && (
+        <ReportScreen
+          onToast={showToast}
+          plan={plan}
+          reportsLeft={reportsLeft}
+          onUseReport={handleUseReport}
+          onOpenPlans={()=>setModal("credits")}
+        />
+      )}
       {screen==="l3"     && <Level3 onGoHome={goHome} onToast={showToast}/>}
 
       {/* Modals */}
+      {modal==="auth" && (
+        <AuthModal onClose={()=>setModal(null)} onSignIn={signInWithEmail}/>
+      )}
       {modal==="paywall" && (
-        <PaywallModal onClose={()=>setModal(null)} onUnlock={handleUnlock}/>
+        <PaywallModal onClose={()=>setModal(null)} onUnlock={()=>setModal("credits")}/>
       )}
       {modal==="credits" && (
-        <CreditPackageModal onClose={()=>setModal(null)} onBuy={handleBuyCredits}/>
+        <CreditPackageModal onClose={()=>setModal(null)} onBuy={handleSubscribe} currentPlanId={plan}/>
       )}
       {modal==="creditConfirm" && (
         <CreditConfirmModal
@@ -2616,7 +3009,14 @@ export default function App() {
         />
       )}
       {modal==="launchOffer" && (
-        <LaunchOfferModal onClose={()=>setModal(null)} onPay={()=>{setModal(null);goReport();}}/>
+        <LaunchOfferModal onClose={()=>setModal(null)} onPay={()=>{
+          setModal(null);
+          setPlan("plus");
+          setCredits(planById("plus").monthlyCredits);
+          setReportsLeft(planById("plus").reportsIncluded);
+          showToast("✓ สมัครแผน Plus สำเร็จ — เดือนแรก ฿599 (ลด 80%) จากนั้น ฿2,990/เดือน");
+          goReport();
+        }}/>
       )}
 
       <Toast msg={toast}/>
@@ -2625,7 +3025,11 @@ export default function App() {
 }
 
 /* ── Launch Offer Modal (Special ฿4,900) ── */
+/* ── Launch Offer Modal — first-month discount on the Plus plan
+   (replaces the old one-time ฿4,900 report purchase). Still a strong
+   anchor/urgency promo, but now it starts a recurring subscription. ── */
 function LaunchOfferModal({ onClose, onPay }) {
+  const plus = planById("plus");
   return (
     <Overlay onClose={onClose}>
       <div style={{
@@ -2651,8 +3055,8 @@ function LaunchOfferModal({ onClose, onPay }) {
           </div>
           <div style={{fontFamily:"Georgia,serif",fontSize:20,fontWeight:700,
             color:"#F0EAE0",lineHeight:1.4}}>
-            Premium Feasibility Report<br/>
-            <span style={{color:"#FF6B35"}}>AI Powered</span>
+            แผน Plus — เดือนแรก<br/>
+            <span style={{color:"#FF6B35"}}>ลด 80%</span>
           </div>
         </div>
 
@@ -2663,30 +3067,30 @@ function LaunchOfferModal({ onClose, onPay }) {
             borderRadius:12,padding:"18px",marginBottom:18,textAlign:"center",
           }}>
             <div style={{fontSize:13,color:C.mist,marginBottom:4}}>
-              ราคาตลาดจ้างบริษัทที่ปรึกษา
+              ราคาปกติแผน Plus
             </div>
             <div style={{fontFamily:"monospace",fontSize:16,
               textDecoration:"line-through",color:C.mist,marginBottom:6}}>
-              ฿49,000
+              ฿{plus.price.toLocaleString()}/เดือน
             </div>
             <div style={{display:"flex",alignItems:"center",justifyContent:"center",gap:10}}>
               <span style={{fontFamily:"monospace",fontSize:32,fontWeight:700,color:C.forest}}>
-                ฿4,900
+                ฿599
               </span>
               <div style={{background:"#FF6B35",color:"#fff",fontSize:10,fontWeight:700,
-                padding:"4px 10px",borderRadius:20}}>ลด 90%</div>
+                padding:"4px 10px",borderRadius:20}}>ลด 80%</div>
             </div>
             <div style={{fontSize:12,color:C.barkLt,marginTop:4}}>
-              ประหยัดทันที <strong>฿44,100</strong>
+              เดือนแรกเท่านั้น · หลังจากนั้น ฿{plus.price.toLocaleString()}/เดือน · ยกเลิกได้ทุกเมื่อ
             </div>
           </div>
 
           {/* What you get */}
           {[
-            "⚡ ได้รับ PDF รายงานฉบับเต็มใน 5 นาที (ไม่ต้องรอ 2 สัปดาห์)",
+            "⚡ สร้างรายงาน PDF ฉบับเต็มได้ 1 ฉบับ/เดือน ใน 5 นาที",
             "✓ ข้อมูลผังเมืองล่าสุด พร้อมยื่นธนาคาร / นายทุน",
-            "✓ ROI 3 รูปแบบ + GFA สูงสุด + คำแนะนำ AI",
-            "✓ รายงาน PDF พร้อมพิมพ์ส่งได้ทันที",
+            "✓ เครดิตวิเคราะห์ ROI 15 แปลง/เดือน",
+            "✓ ยกเลิกแผนได้ทุกเมื่อ ไม่มีข้อผูกมัด",
           ].map(f => (
             <div key={f} style={{fontSize:13,color:C.barkLt,marginBottom:8,lineHeight:1.6}}>
               {f}
@@ -2703,16 +3107,16 @@ function LaunchOfferModal({ onClose, onPay }) {
           }}
           onMouseEnter={e=>e.currentTarget.style.transform="translateY(-1px)"}
           onMouseLeave={e=>e.currentTarget.style.transform="none"}>
-            💳 ชำระ ฿4,900 · รับรายงานทันที →
+            💳 เริ่มสมัคร ฿599 เดือนแรก →
           </button>
 
           <div style={{
             display:"flex",justifyContent:"center",gap:20,marginTop:12,
-            fontSize:11,color:C.mist,
+            fontSize:11,color:C.mist,flexWrap:"wrap",
           }}>
-            <span>🔒 ชำระปลอดภัย</span>
-            <span>📋 ได้ไฟล์รายงานทันที 100%</span>
-            <span>⚡ PromptPay / Card</span>
+            <span>🔒 ชำระผ่านบัตรปลอดภัย</span>
+            <span>📋 ใบแจ้งหนี้ขึ้นชื่อ FEASX</span>
+            <span>⚡ ยกเลิกได้ทุกเมื่อ</span>
           </div>
         </div>
       </div>
@@ -2722,7 +3126,9 @@ function LaunchOfferModal({ onClose, onPay }) {
 
 const LBL = {display:"block",fontSize:11,fontWeight:600,color:"#8B6F47",letterSpacing:".08em",textTransform:"uppercase",marginBottom:5};
 const LBL_GOLD = {display:"block",fontSize:10,fontWeight:600,color:"#9A7A48",letterSpacing:".1em",textTransform:"uppercase",marginBottom:5};
-function ReportScreen({ onToast }) {
+function ReportScreen({ onToast, plan="free", reportsLeft=0, onUseReport, onOpenPlans }) {
+  const isMobile = useIsMobile();
+  const hasReportAccess = reportsLeft > 0;
   const [step, setStep] = useState(1); // 1=กรอกข้อมูล 2=AI กำลังสร้าง 3=รายงานพร้อม
   const [form, setForm] = useState({
     title:"", location:"", district:"", province:"กรุงเทพมหานคร",
@@ -2741,8 +3147,13 @@ function ReportScreen({ onToast }) {
     : null;
 
   async function generateReport() {
+    if (!hasReportAccess) { onOpenPlans && onOpenPlans(); return; }
     if (!form.location || !form.size) {
       onToast("กรุณากรอกทำเลและขนาดที่ดินก่อน"); return;
+    }
+    if (onUseReport) {
+      const ok = await onUseReport();
+      if (ok === false) return; // เครดิตรายงานหมดไปแล้วระหว่างทาง (race condition) — หยุดที่นี่
     }
     setStep(2); setLoading(true);
 
@@ -2820,8 +3231,10 @@ ROI ที่คำนวณได้:
           <p style={{fontSize:14,color:C.barkLt,lineHeight:1.7}}>กรอกข้อมูลด้านล่าง — AI จะสร้างรายงาน Feasibility Study เต็มรูปแบบภาษาไทย พร้อมพิมพ์ส่งนักลงทุนได้ทันที</p>
         </div>
 
-        <div style={{background:C.white, border:`1px solid ${C.sand}`, borderRadius:16, padding:"28px 24px"}}>
-          <div style={{display:"grid", gridTemplateColumns:"1fr 1fr", gap:14}}>
+        <div style={{background:C.white, border:`1px solid ${C.sand}`, borderRadius:16,
+          padding: isMobile ? "22px 18px" : "28px 24px",
+          paddingBottom: isMobile ? 100 : undefined}}>
+          <div style={{display:"grid", gridTemplateColumns: isMobile ? "1fr" : "1fr 1fr", gap:14}}>
             <div style={{gridColumn:"1/-1"}}>
               <label style={LBL}>ชื่อโครงการ / หัวข้อรายงาน</label>
               <input value={form.title} onChange={e=>set("title",e.target.value)}
@@ -2882,7 +3295,8 @@ ROI ที่คำนวณได้:
 
           {/* Preview ROI */}
           {roi && (
-            <div style={{marginTop:18,background:C.creamDk,borderRadius:10,padding:"14px 16px",display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:12}}>
+            <div style={{marginTop:18,background:C.creamDk,borderRadius:10,padding:"14px 16px",display:"grid",
+              gridTemplateColumns: isMobile ? "repeat(2,minmax(0,1fr))" : "repeat(4,1fr)", gap:12}}>
               {[["GFA สูงสุด",(roi.GFA_Max||0).toLocaleString()+" ตร.ม."],
                 ["ROI Type A",roi.Type_A_ROI?.toFixed(1)+"%"],
                 ["ROI Type B",roi.Type_B_ROI?.toFixed(1)+"%"],
@@ -2896,45 +3310,100 @@ ROI ที่คำนวณได้:
             </div>
           )}
 
-          {/* Pricing comparison */}
-          <div style={{marginTop:20,background:C.cream,border:`1.5px solid ${C.amber}`,borderRadius:12,padding:"16px 18px",position:"relative"}}>
-            <div style={{position:"absolute",top:-10,left:14,background:C.amber,color:C.white,
-              fontSize:10,fontWeight:700,letterSpacing:".1em",textTransform:"uppercase",padding:"3px 12px",borderRadius:20}}>
-              Premium Feasibility Report
-            </div>
-            {/* Strikethrough */}
-            <div style={{display:"flex",alignItems:"center",gap:10,marginTop:6,marginBottom:4,flexWrap:"wrap"}}>
-              <div style={{fontSize:13,color:C.mist,textDecoration:"line-through",fontFamily:"monospace"}}>
-                ฿40,000 — ฿200,000
+          {/* Plan-gated access — hidden inline on mobile, shown inside the sticky bar instead */}
+          {!isMobile && (
+            <div style={{marginTop:20,
+              background: hasReportAccess ? "#EAF2EC" : C.cream,
+              border:`1.5px solid ${hasReportAccess ? C.forest : C.amber}`,
+              borderRadius:12,padding:"16px 18px",position:"relative"}}>
+              <div style={{position:"absolute",top:-10,left:14,
+                background: hasReportAccess ? C.forest : C.amber,color:C.white,
+                fontSize:10,fontWeight:700,letterSpacing:".1em",textTransform:"uppercase",padding:"3px 12px",borderRadius:20}}>
+                Premium Feasibility Report
               </div>
-              <div style={{fontSize:10,background:"#FFF0E0",color:C.amber,padding:"2px 8px",borderRadius:20,fontWeight:700}}>
-                ราคาตลาดจ้างบริษัทที่ปรึกษา
-              </div>
+              {hasReportAccess ? (
+                <>
+                  <div style={{display:"flex",alignItems:"baseline",gap:6,marginTop:6,marginBottom:10}}>
+                    <span style={{fontFamily:"monospace",fontSize:22,fontWeight:700,color:C.forest}}>✓ รวมในแผน {planById(plan).label}</span>
+                  </div>
+                  <div style={{fontSize:12,color:C.barkLt,lineHeight:1.7}}>
+                    เหลือสิทธิ์สร้างรายงาน <strong style={{color:C.forest}}>
+                      {reportsLeft>=999 ? "ไม่จำกัด" : `${reportsLeft} ฉบับ`}
+                    </strong> ในรอบเดือนนี้ · เทียบเท่าจ้างที่ปรึกษา ฿40,000+
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div style={{display:"flex",alignItems:"center",gap:10,marginTop:6,marginBottom:4,flexWrap:"wrap"}}>
+                    <div style={{fontSize:13,color:C.mist,textDecoration:"line-through",fontFamily:"monospace"}}>
+                      ฿40,000 — ฿200,000
+                    </div>
+                    <div style={{fontSize:10,background:"#FFF0E0",color:C.amber,padding:"2px 8px",borderRadius:20,fontWeight:700}}>
+                      ราคาตลาดจ้างบริษัทที่ปรึกษา
+                    </div>
+                  </div>
+                  <div style={{fontSize:12,color:C.barkLt,lineHeight:1.7,marginBottom:4}}>
+                    แผนปัจจุบัน (<strong>{planById(plan).label}</strong>) ไม่มีสิทธิ์รายงาน Premium — อัปเกรดเป็น
+                    <strong style={{color:C.forest}}> Plus (฿2,990/เดือน)</strong> หรือ <strong style={{color:C.forest}}>Pro (฿4,900/เดือน)</strong> เพื่อสร้างรายงานได้ทันที
+                  </div>
+                  <div style={{height:1,background:C.sand,marginBottom:10}}/>
+                  <div style={{fontSize:12,color:C.barkLt,lineHeight:1.7}}>
+                    💡 ได้ผลภายใน 5 นาที ไม่ต้องรอสัปดาห์ · ยกเลิกแผนได้ทุกเมื่อ
+                  </div>
+                </>
+              )}
             </div>
-            <div style={{display:"flex",alignItems:"baseline",gap:6,marginBottom:10}}>
-              <span style={{fontFamily:"monospace",fontSize:28,fontWeight:700,color:C.forest}}>฿4,900</span>
-              <span style={{fontSize:12,color:C.barkLt}}>/ รายงาน · จ่ายครั้งเดียว</span>
-            </div>
-            <div style={{height:1,background:C.sand,marginBottom:10}}/>
-            <div style={{fontSize:12,color:C.barkLt,lineHeight:1.7}}>
-              💡 <strong style={{color:C.bark}}>ประหยัดกว่า 90%</strong> เทียบกับจ้างที่ปรึกษา · ได้ผลภายใน 5 นาที ไม่ต้องรอสัปดาห์
-            </div>
-          </div>
+          )}
 
-          <button onClick={generateReport} style={{
-            width:"100%",marginTop:14,padding:"14px",
-            background:`linear-gradient(135deg,${C.forest},${C.forestLt})`,
-            color:C.white,border:"none",borderRadius:10,fontSize:15,fontWeight:700,
-            boxShadow:"0 4px 20px rgba(61,107,79,.3)",cursor:"pointer",transition:"transform .15s"}}
-            onMouseEnter={e=>e.currentTarget.style.transform="translateY(-1px)"}
-            onMouseLeave={e=>e.currentTarget.style.transform="none"}>
-            🤖 ชำระ ฿4,900 · สร้างรายงาน Feasibility ทันที →
-          </button>
-          <div style={{textAlign:"center",fontSize:11,color:C.mist,marginTop:8}}>
-            🔐 PromptPay / บัตรเครดิต · จ่ายครั้งเดียวไม่มีรายเดือน
-          </div>
+          {!isMobile && (
+            <>
+              <button onClick={generateReport} style={{
+                width:"100%",marginTop:14,padding:"14px",
+                background:`linear-gradient(135deg,${C.forest},${C.forestLt})`,
+                color:C.white,border:"none",borderRadius:10,fontSize:15,fontWeight:700,
+                boxShadow:"0 4px 20px rgba(61,107,79,.3)",cursor:"pointer",transition:"transform .15s"}}
+                onMouseEnter={e=>e.currentTarget.style.transform="translateY(-1px)"}
+                onMouseLeave={e=>e.currentTarget.style.transform="none"}>
+                {hasReportAccess ? "🤖 สร้างรายงาน Feasibility ทันที →" : "🔓 อัปเกรดแผนเพื่อสร้างรายงาน →"}
+              </button>
+              <div style={{textAlign:"center",fontSize:11,color:C.mist,marginTop:8}}>
+                {hasReportAccess ? "🔐 รวมอยู่ในค่าสมาชิกรายเดือนแล้ว ไม่มีค่าใช้จ่ายเพิ่ม" : "🔐 เรียกเก็บผ่านบัตร (Stripe) · ยกเลิกได้ทุกเมื่อ"}
+              </div>
+            </>
+          )}
         </div>
       </div>
+
+      {/* Mobile sticky bar — plan status + CTA always reachable,
+          never buried at the bottom of a long form */}
+      {isMobile && (
+        <div style={{
+          position:"fixed", left:0, right:0, bottom:0, zIndex:250,
+          background:C.white, borderTop:`1px solid ${C.sand}`,
+          padding:"10px 16px calc(10px + env(safe-area-inset-bottom))",
+          boxShadow:"0 -6px 24px rgba(44,36,22,.12)",
+        }}>
+          <div style={{display:"flex",alignItems:"baseline",gap:8,marginBottom:8,justifyContent:"center",flexWrap:"wrap"}}>
+            {hasReportAccess ? (
+              <span style={{fontSize:12,color:C.forest,fontWeight:700}}>
+                ✓ แผน {planById(plan).label} · เหลือ {reportsLeft>=999?"ไม่จำกัด":reportsLeft} ฉบับ
+              </span>
+            ) : (
+              <>
+                <span style={{fontSize:11,color:C.mist,textDecoration:"line-through",fontFamily:"monospace"}}>฿40,000+</span>
+                <span style={{fontSize:12,color:C.barkLt}}>ต้องอัปเกรดแผนเพื่อสร้างรายงาน</span>
+              </>
+            )}
+          </div>
+          <button onClick={generateReport} style={{
+            width:"100%",padding:"13px",
+            background:`linear-gradient(135deg,${C.forest},${C.forestLt})`,
+            color:C.white,border:"none",borderRadius:10,fontSize:15,fontWeight:700,
+            boxShadow:"0 4px 20px rgba(61,107,79,.3)",cursor:"pointer"}}>
+            {hasReportAccess ? "🤖 สร้างรายงานทันที →" : "🔓 อัปเกรดแผนเพื่อสร้างรายงาน →"}
+          </button>
+        </div>
+      )}
     </div>
   );
 
