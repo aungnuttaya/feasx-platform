@@ -1,17 +1,18 @@
 import { useState, useEffect, useRef, useMemo } from "react";
 import { createClient } from "@supabase/supabase-js";
+import landDomain from "../lib/domain/land.cjs";
+import aiClient from "../lib/ai/client.cjs";
+import intakeDomain from "../lib/domain/intake.cjs";
+import authService from "../lib/auth.cjs";
+import fixtures from "../lib/domain/fixtures.cjs";
+const { parseLandSize, calcROI } = landDomain;
+const { requestAI } = aiClient;
 
-/* ── Supabase client ──
-   NOTE: SUPABASE_ANON_KEY below is the public "anon"/"publishable" key —
-   it is safe to ship in client code (that's what it's for), unlike a
-   service_role key which must never appear in frontend code. For a
-   real deployment, prefer reading these from env vars instead of
-   hardcoding (Next.js: process.env.NEXT_PUBLIC_SUPABASE_URL /
-   process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY) so switching between
-   dev/prod projects doesn't require editing this file. */
-const SUPABASE_URL = "https://godxkfidqwianrplmolx.supabase.co";
-const SUPABASE_ANON_KEY = "sb_publishable_unnfdsuCvZSg3QNSmJJgGw_6vRfwP5s";
-const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+// No hardcoded project binding. Unconfigured development runs in guest mode.
+// Day 2 tests do not set these variables or connect to a real project.
+const supabase = process.env.NEXT_PUBLIC_SUPABASE_URL && process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
+  ? createClient(process.env.NEXT_PUBLIC_SUPABASE_URL, process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY)
+  : null;
 
 /* ── Auth hook — tracks the current Supabase session and exposes
    sign-in (magic link / OTP email, no password to manage) and
@@ -22,6 +23,7 @@ function useSupabaseAuth() {
   const [authLoading, setAuthLoading] = useState(true);
 
   useEffect(() => {
+    if (!supabase) { setAuthLoading(false); return; }
     let active = true;
     supabase.auth.getSession().then(({ data }) => {
       if (!active) return;
@@ -36,6 +38,7 @@ function useSupabaseAuth() {
   }, []);
 
   async function signInWithEmail(email) {
+    if (!supabase) return { error: { message: "Sandbox authentication is not configured" } };
     const { error } = await supabase.auth.signInWithOtp({
       email,
       options: { emailRedirectTo: typeof window !== "undefined" ? window.location.href : undefined },
@@ -43,7 +46,7 @@ function useSupabaseAuth() {
     return { error };
   }
 
-  async function signOut() { await supabase.auth.signOut(); }
+  async function signOut() { if (supabase) await supabase.auth.signOut(); }
 
   return { user, authLoading, signInWithEmail, signOut };
 }
@@ -92,27 +95,6 @@ const PLANS = [
 function planById(id) { return PLANS.find(p=>p.id===id) || PLANS[0]; }
 
 /* ── ENGINE L1: Unit Parser ── */
-function parseLandSize(raw) {
-  const s = (raw||"").toString().trim().toLowerCase();
-  const raiM = s.match(/(\d+\.?\d*)\s*ไร่?\s*(\d+\.?\d*)?\s*ง(าน)?\s*(\d+\.?\d*)?/);
-  if (raiM) {
-    const t = parseFloat(raiM[1]||0)*400 + parseFloat(raiM[2]||0)*100 + parseFloat(raiM[4]||0);
-    return { land_size_wah: +t.toFixed(2), land_size_sqm: +(t*4).toFixed(2) };
-  }
-  const dM = s.match(/^(\d+)-(\d+)-(\d+\.?\d*)$/);
-  if (dM) {
-    const t = parseFloat(dM[1])*400 + parseFloat(dM[2])*100 + parseFloat(dM[3]);
-    return { land_size_wah: +t.toFixed(2), land_size_sqm: +(t*4).toFixed(2) };
-  }
-  const wM = s.match(/(\d+\.?\d*)\s*(ตร\.?ว\.?|ตารางวา|sq\.?w)/);
-  if (wM) { const w=parseFloat(wM[1]); return { land_size_wah:w, land_size_sqm:+(w*4).toFixed(2) }; }
-  const mM = s.match(/(\d+\.?\d*)\s*(ตร\.?ม\.?|ตารางเมตร|sqm|m2)/);
-  if (mM) { const m=parseFloat(mM[1]); return { land_size_wah:+(m/4).toFixed(2), land_size_sqm:+m.toFixed(2) }; }
-  const n = parseFloat(s);
-  if (!isNaN(n)) return { land_size_wah:n, land_size_sqm:+(n*4).toFixed(2) };
-  return { land_size_wah:0, land_size_sqm:0 };
-}
-
 /* ── ENGINE L2: Zone DB — ครอบคลุมทั้งประเทศ ── */
 const ZONE_DB = {
   // ════ กรุงเทพมหานคร — 50 เขต ════
@@ -454,24 +436,6 @@ function enrichZone(province, district) {
 }
 
 /* ── ENGINE L3: ROI ── */
-function calcROI({ land_size_sqm, far_ratio, road_width_m, zoning_color, price_baht }) {
-  const gfa = land_size_sqm * far_ratio;
-  const sp = zoning_color.startsWith("แดง") ? 140000 : zoning_color.startsWith("ส้ม") ? 100000 : 70000;
-  const cA = gfa*45000 + price_baht, rA = gfa*0.8*sp;
-  const roiA = cA > 0 ? (rA-cA)/cA*100 : 0;
-  const rent = gfa*0.75*(zoning_color.startsWith("แดง")?600:zoning_color.startsWith("ส้ม")?450:300)*12;
-  const cB = gfa*25000 + price_baht;
-  const roiB = cB > 0 ? rent/cB*100 : 0;
-  const legal = road_width_m < 8 || gfa < 2000;
-  let roiC = null, block = "";
-  if (legal) { block = road_width_m < 8 ? "⛔ ถนน < 8 ม." : "⛔ GFA < 2,000 ตร.ม."; }
-  else {
-    const comm = gfa*0.8*(zoning_color.startsWith("แดง")?1200:zoning_color.startsWith("ส้ม")?900:650)*12;
-    const cC = gfa*60000 + price_baht;
-    roiC = cC > 0 ? comm/cC*100 : 0;
-  }
-  return { GFA_Max:+gfa.toFixed(0), Type_A_ROI:+roiA.toFixed(2), Type_B_ROI:+roiB.toFixed(2), Type_C_ROI:roiC!==null?+roiC.toFixed(2):null, Type_C_Block:block };
-}
 function processRow(r) {
   const size = parseLandSize(r.raw_size);
   const zone = enrichZone(r.province, r.district);
@@ -479,228 +443,11 @@ function processRow(r) {
   return { ...r, ...size, ...zone, ...calcROI({...size,...zone,price_baht:price}) };
 }
 
-const REAL_LANDS = [
-  {id:1,source:"kaidee",title:"รับนายหน้าจ่ายคอมไม่ผูกมัดสัญญาคอม3เปอร์เซ็นต์ ขายที่ดิ",price:42000000,district:"ราษฎร์บูรณะ",province:"กรุงเทพมหานคร",raw_size:"462 ตารางวา",land_size_wah:462.0,land_size_sqm:1848.0,price_per_wah:90909},
-  {id:2,source:"kaidee",title:"🔥 คุ้มสุดๆ ที่ดินหุบบอน ศรีราชา 3 ไร่ 39 ตร.ว. เพียง 10",price:10000000,district:"ศรีราชา",province:"ชลบุรี",raw_size:"1239",land_size_wah:1239.0,land_size_sqm:4956.0,price_per_wah:8071},
-  {id:3,source:"kaidee",title:"🎉 ขายที่ดินทำเลทอง สุขุมวิท 101 ทับ 1 พร้อมสิ่งปลูกสร้า",price:20000000,district:"พระโขนง",province:"กรุงเทพมหานคร",raw_size:"142 ตารางวา",land_size_wah:142.0,land_size_sqm:568.0,price_per_wah:140845},
-  {id:4,source:"kaidee",title:"ที่ดิน กันทรวิชัย มหาสารคาม",price:3500000,district:"กันทรวิชัย",province:"มหาสารคาม",raw_size:"3 ไร่",land_size_wah:1200.0,land_size_sqm:4800.0,price_per_wah:2917},
-  {id:5,source:"kaidee",title:"&quot;สวนสวรรค์&quot; สวรรค์บนดินที่คุณครอบครองได้.",price:130000000,district:"ปากช่อง",province:"นครราชสีมา",raw_size:"52800 ตารางเมตร",land_size_wah:13200.0,land_size_sqm:52800.0,price_per_wah:9848},
-  {id:6,source:"kaidee",title:"ขายที่ดินพร้อมอาคารสำนักงาน จอดรถ 40 คัน ใกล้ MRT บางพล",price:49900000,district:"บางบัวทอง",province:"นนทบุรี",raw_size:"483",land_size_wah:483.0,land_size_sqm:1932.0,price_per_wah:103313},
-  {id:7,source:"kaidee",title:"ที่ดินติดทะเลติดเขาสามมุขพร้อมคาเฟ่และที่พัก",price:259000000,district:"เมือง",province:"ชลบุรี",raw_size:"ชลบุรี465 ตารางวา",land_size_wah:465.0,land_size_sqm:1860.0,price_per_wah:556989},
-  {id:8,source:"kaidee",title:"ขายที่ดินเขตเศรฐกิจ (EEC) 19 ไร่ 2 งาน ติดถนนสุขุมวิท อ",price:330000000,district:"สัตหีบ",province:"ชลบุรี",raw_size:"19 ไร่",land_size_wah:7600.0,land_size_sqm:30400.0,price_per_wah:43421},
-  {id:9,source:"kaidee",title:"ที่ดินในชุมชน ใกล้เมือง เชียงใหม่ สันป่าตอง",price:2470000,district:"สันป่าตอง",province:"เชียงใหม่",raw_size:"247 ตารางวา",land_size_wah:247.0,land_size_sqm:988.0,price_per_wah:10000},
-  {id:10,source:"kaidee",title:"ซอยวัดอุโมงค์(หลังมอ) ทำเลดี",price:22000000,district:"เมือง",province:"เชียงใหม่",raw_size:"เชียงใหม่220 ตารางวา",land_size_wah:220.0,land_size_sqm:880.0,price_per_wah:100000},
-  {id:11,source:"kaidee",title:"ที่ดินใกล้เมืองเชียงใหม่ ห่างจากเซ็นเฟส 10 นาที แปลงมุม",price:4025000,district:"ดอยสะเก็ด",province:"เชียงใหม่",raw_size:"161 ตารางวา",land_size_wah:161.0,land_size_sqm:644.0,price_per_wah:25000},
-  {id:12,source:"kaidee",title:"ขายที่ดิน 2 ไร่ 7 ตารางวา ติดถนนมาลัยแมน",price:8900000,district:"กำแพงแสน",province:"นครปฐม",raw_size:"2 ไร่",land_size_wah:800.0,land_size_sqm:3200.0,price_per_wah:11125},
-  {id:13,source:"kaidee",title:"ขายที่ดินสวยมาก หมู่บ้านภูนภารีสอร์ท 108 ตรว. มวกเหล็ก",price:5000000,district:"ปากช่อง",province:"นครราชสีมา",raw_size:"108 ตารางวา",land_size_wah:108.0,land_size_sqm:432.0,price_per_wah:46296},
-  {id:14,source:"kaidee",title:"ที่ดินเหมาะสร้าง Resort , Homestay",price:40000,district:"บางซ้าย",province:"พระนครศรีอยุธยา",raw_size:"18 ไร่",land_size_wah:7200.0,land_size_sqm:28800.0,price_per_wah:6},
-  {id:15,source:"kaidee",title:"ที่ดิน บ้านแพ้ว สมุทรสาคร มีโฉนด ขายสวนมะพร้าว บ้านแพ้ว",price:18900000,district:"บ้านแพ้ว",province:"สมุทรสาคร",raw_size:"10 ไร่",land_size_wah:4000.0,land_size_sqm:16000.0,price_per_wah:4725},
-  {id:16,source:"kaidee",title:"ขายที่สวย 2 แปลง",price:10447500,district:"สันทราย",province:"เชียงใหม่",raw_size:"2786",land_size_wah:2786.0,land_size_sqm:11144.0,price_per_wah:3750},
-  {id:17,source:"kaidee",title:"ที่ดินให้เช่าในเขตเทศบาล",price:20000,district:"บางซ้าย",province:"พระนครศรีอยุธยา",raw_size:"1 ไร่",land_size_wah:400.0,land_size_sqm:1600.0,price_per_wah:50},
-  {id:18,source:"kaidee",title:"ขายที่ดินพระรามเก้า ซอย 62-64 ทำเลยดี ซอยสวย ใกล้เดอะไน",price:40391000,district:"ประเวศ",province:"กรุงเทพมหานคร",raw_size:"239 ตารางวา",land_size_wah:239.0,land_size_sqm:956.0,price_per_wah:169000},
-  {id:19,source:"kaidee",title:"ขายด่วน ที่ดินศูนย์วิจัย ถูกที่สุดแปลงสุดท้าย 290,000 บ",price:116000000,district:"ห้วยขวาง",province:"กรุงเทพมหานคร",raw_size:"290000 ตารางวา",land_size_wah:290000.0,land_size_sqm:1160000.0,price_per_wah:400},
-  {id:20,source:"kaidee",title:"ขายด่วน ที่ดินติดถนนรัชดาภิเษก ใกล้เมเจอร์รัชโยธินเพียง",price:195000000,district:"จตุจักร",province:"กรุงเทพมหานคร",raw_size:"500 ตารางวา",land_size_wah:500.0,land_size_sqm:2000.0,price_per_wah:390000},
-  {id:21,source:"kaidee",title:"ขายที่สวนยาง 103 ไร่ โฉนดครุฑแดง ติดถนนคอนกรีต ยินดีรับ",price:103000000,district:"พุนพิน",province:"สุราษฎร์ธานี",raw_size:"103 ไร่",land_size_wah:41200.0,land_size_sqm:164800.0,price_per_wah:2500},
-  {id:22,source:"kaidee",title:"แบ่งขายที่ดิน 300 ตรว. ราคาต่อรองได้ ซ.ลาดพร้าว 88-1(88",price:60000000,district:"วังทองหลาง",province:"กรุงเทพมหานคร",raw_size:"300 ตารางวา",land_size_wah:300.0,land_size_sqm:1200.0,price_per_wah:200000},
-  {id:23,source:"kaidee",title:"ขายด่วน ที่ดินเปล่า 14 ไร่ ติดถนนดิน ทำเล ต.อาฮี อ.ท่าล",price:3200000,district:"ท่าลี่",province:"เลย",raw_size:"14 ไร่",land_size_wah:5600.0,land_size_sqm:22400.0,price_per_wah:571},
-  {id:24,source:"kaidee",title:"ให้เช่าที่ดินดอนเมือง ติดแหล่งชุมชน เหมาะทำธุรกิจ",price:20000,district:"ดอนเมือง",province:"กรุงเทพมหานคร",raw_size:"2 ไร่",land_size_wah:800.0,land_size_sqm:3200.0,price_per_wah:25},
-  {id:25,source:"kaidee",title:"🎊ที่ดินสวย 303 ตร.ว ใจกลางพิษณุโลกใกล้เซ็นทรัล✨ 6.5 ล้า",price:6500000,district:"เมือง",province:"พิษณุโลก",raw_size:"พิษณุโลก1212 ตารางเมตร",land_size_wah:303.0,land_size_sqm:1212.0,price_per_wah:21452},
-  {id:26,source:"kaidee",title:"🔥 นักลงทุนห้ามพลาด ที่ดินศรีราชาฝั่งทะเล 1 ไร่ 195 ตร.ว",price:35700000,district:"ศรีราชา",province:"ชลบุรี",raw_size:"595 ตารางวา",land_size_wah:595.0,land_size_sqm:2380.0,price_per_wah:60000},
-  {id:27,source:"kaidee",title:"🎉ขายที่ดินบ้านฉาง ระยอง ใกล้สนามบินอู่ตะเภา 6 ไร่ 89 ตร",price:65000000,district:"บ้านฉาง",province:"ระยอง",raw_size:"9600 ตารางเมตร",land_size_wah:2400.0,land_size_sqm:9600.0,price_per_wah:27083},
-  {id:28,source:"kaidee",title:"ขายที่ดินแถวนครปฐม 2 งาน (200 ตร.วา) ราคา 990,000 บาท",price:899000,district:"สามพราน",province:"นครปฐม",raw_size:"200 ตารางวา",land_size_wah:200.0,land_size_sqm:800.0,price_per_wah:4495},
-  {id:29,source:"kaidee",title:"ให้เช่าที่ดิน เพชรเกษม 118 - พุทธมณฑลสาย 4 18 ไร่",price:180000,district:"กระทุ่มแบน",province:"สมุทรสาคร",raw_size:"18 ไร่",land_size_wah:7200.0,land_size_sqm:28800.0,price_per_wah:25},
-  {id:30,source:"kaidee",title:"ขายที่ดินนครปฐม 1 ไร่ 1งาน (500 ตร.วา) ราคา 2.39 ล้านบา",price:2290000,district:"เมือง",province:"นครปฐม",raw_size:"นครปฐม500 ตารางวา",land_size_wah:500.0,land_size_sqm:2000.0,price_per_wah:4580},
-  {id:31,source:"kaidee",title:"ขายที่ดิน",price:3600000,district:"ห้วยเม็ก",province:"กาฬสินธุ์",raw_size:"4.2 ไร่",land_size_wah:1680.0,land_size_sqm:6720.0,price_per_wah:2143},
-  {id:32,source:"kaidee",title:"ขายที่พร้อมสิ่งปลูกสร้าง",price:890000,district:"เมือง",province:"สกลนคร",raw_size:"สกลนคร92 ตารางวา",land_size_wah:92.0,land_size_sqm:368.0,price_per_wah:9674},
-  {id:33,source:"kaidee",title:"🌴 สวรรค์ส่วนตัว เริ่มต้นที่นี่ ที่ดินติดชายหาด 28 ไร่ ท",price:95800000,district:"ทุ่งตะโก",province:"ชุมพร",raw_size:"27 ไร่",land_size_wah:10800.0,land_size_sqm:43200.0,price_per_wah:8870},
-  {id:34,source:"kaidee",title:"ที่ดินเปล่าสวยๆ",price:1650000,district:"บางคล้า",province:"ฉะเชิงเทรา",raw_size:"3.3.58 ไร่",land_size_wah:1432.0,land_size_sqm:5728.0,price_per_wah:1152},
-  {id:35,source:"kaidee",title:"Land reclamation 67 square wa, beautiful plot, next to ",price:2000000,district:"ลาดกระบัง",province:"กรุงเทพมหานคร",raw_size:"268 ตารางเมตร",land_size_wah:67.0,land_size_sqm:268.0,price_per_wah:29851},
-  {id:36,source:"kaidee",title:"ที่ดิน + ห้องเช่า 3 ชั้น 370 ตร.ว. ที่ดิน + ห้องเช่า ซอ",price:31900000,district:"บึงกุ่ม",province:"กรุงเทพมหานคร",raw_size:"370 ตารางวา",land_size_wah:370.0,land_size_sqm:1480.0,price_per_wah:86216},
-  {id:37,source:"kaidee",title:"ที่ดินเปล่า 36 ไร่ 279 ตร.ว. ที่ดิน ถนนแสงชูโต กาญจนบุร",price:12000000,district:"ไทรโยค",province:"กาญจนบุรี",raw_size:"36 ไร่",land_size_wah:14400.0,land_size_sqm:57600.0,price_per_wah:833},
-  {id:38,source:"kaidee",title:"ขายยกแปลง ที่ดินนครชัยศรี 9 ไร่กว่า แบ่งแล้ว 10 โฉนด พร",price:38300000,district:"นครชัยศรี",province:"นครปฐม",raw_size:"3838",land_size_wah:3838.0,land_size_sqm:15352.0,price_per_wah:9979},
-  {id:39,source:"kaidee",title:"ขายที่ดินพร้อมบ้านอยู่อาศัย",price:12900000,district:"วังสะพุง",province:"เลย",raw_size:"22.37 ไร่",land_size_wah:8948.0,land_size_sqm:35792.0,price_per_wah:1442},
-  {id:40,source:"kaidee",title:"ขายที่ดินปัญญาอินทรา 103.4 ตรว. วิวสนามกอล์ฟ ราคา 5.7 ล",price:5700000,district:"คันนายาว",province:"กรุงเทพมหานคร",raw_size:"103.4 ตารางวา",land_size_wah:103.4,land_size_sqm:413.6,price_per_wah:55126},
-  {id:41,source:"kaidee",title:"ขายที่ดิน ทำเลทอง หน้ากว้าง ติดถนนดำ",price:11385000,district:"อุทัย",province:"พระนครศรีอยุธยา",raw_size:"8280 ตารางวา",land_size_wah:8280.0,land_size_sqm:33120.0,price_per_wah:1375},
-  {id:42,source:"kaidee",title:"ขายที่ดินเปล่า☘️ ถูกที่สุดในโครงการ 180 บางปู บีชเฮ้าส์",price:5400000,district:"เมือง",province:"สมุทรปราการ",raw_size:"สมุทรปราการ164 ตารางวา",land_size_wah:164.0,land_size_sqm:656.0,price_per_wah:32927},
-  {id:43,source:"kaidee",title:"ที่ดินเปล่า 461 ตร.ว. ที่ดิน ซอยแจ้งวัฒนะ1 หลัง รร.ไผทอ",price:39646000,district:"บางเขน",province:"กรุงเทพมหานคร",raw_size:"1.61 ไร่",land_size_wah:644.0,land_size_sqm:2576.0,price_per_wah:61562},
-  {id:44,source:"kaidee",title:"ที่ดินเปล่า 13 ไร่ 113 ตร.ว. ที่ดินเปล่า ใกล้วัดโพรงอาก",price:6000000,district:"บางน้ำเปรี้ยว",province:"ฉะเชิงเทรา",raw_size:"13.113 ไร่",land_size_wah:5245.2,land_size_sqm:20980.8,price_per_wah:1144},
-  {id:45,source:"kaidee",title:"ให้เช่าที่ดินรามคำแหง 21 เนื้อที่ 600 ตารางวา แปลงสวย ท",price:70000,district:"วังทองหลาง",province:"กรุงเทพมหานคร",raw_size:"600 ตารางวา",land_size_wah:600.0,land_size_sqm:2400.0,price_per_wah:117},
-  {id:46,source:"kaidee",title:"ขายที่ดินแปลงสวย สภาพแวดล้อมดี ใกล้ รพ.กรุงเทพ",price:91200000,district:"ห้วยขวาง",province:"กรุงเทพมหานคร",raw_size:"240 ตารางวา",land_size_wah:240.0,land_size_sqm:960.0,price_per_wah:380000},
-  {id:47,source:"kaidee",title:"ขายที่ดินพระราม 9 ติดถนนใหญ่และสถานีรถไฟฟ้าสายสีส้ม ขึ้",price:350000,district:"ห้วยขวาง",province:"กรุงเทพมหานคร",raw_size:"4 ไร่",land_size_wah:1600.0,land_size_sqm:6400.0,price_per_wah:219},
-  {id:48,source:"kaidee",title:"ขายที่ดินหนามแดง-บางพลี 1-3-58 ไร่ เข้าทาง ซอย หนามแดง ",price:30320000,district:"บางพลี",province:"สมุทรปราการ",raw_size:"758",land_size_wah:758.0,land_size_sqm:3032.0,price_per_wah:40000},
-  {id:49,source:"kaidee",title:"ขายที่ดินเชียงใหม่ติดถนนติดแม่น้ำ",price:19900000,district:"เมือง",province:"เชียงใหม่",raw_size:"เชียงใหม่2777 ตารางวา",land_size_wah:2777.0,land_size_sqm:11108.0,price_per_wah:7166},
-  {id:50,source:"kaidee",title:"ขายด่วน ที่ดินทำเลทอง 300 ไร่ ติดถนน 4 เลน สาย 3574 อ.ป",price:750000000,district:"ปลวกแดง",province:"ระยอง",raw_size:"300 ไร่",land_size_wah:120000.0,land_size_sqm:480000.0,price_per_wah:6250},
-  {id:51,source:"kaidee",title:"ที่ดินสวยติดถนน ลาดยาง",price:95000,district:"วิเชียรบุรี",province:"เพชรบูรณ์",raw_size:"65 ไร่",land_size_wah:26000.0,land_size_sqm:104000.0,price_per_wah:4},
-  {id:52,source:"kaidee",title:"ที่ดินในเมืองริมน้ำ ลำตะคอง (ปากช่อง-เขาใหญ่) 30 ไร่ 3 ",price:169235000,district:"ปากช่อง",province:"นครราชสีมา",raw_size:"30-3-8 ไร่",land_size_wah:3200.0,land_size_sqm:12800.0,price_per_wah:52886},
-  {id:53,source:"kaidee",title:"ขายที่ดินสวยๆ",price:1450000,district:"เมือง",province:"นครปฐม",raw_size:"นครปฐม1899 ตารางวา",land_size_wah:1899.0,land_size_sqm:7596.0,price_per_wah:764},
-  {id:54,source:"kaidee",title:"ที่ดินเปล่า 359.1 ตร.ว. ที่ดิน ถนนรามคำแหง ที่ดินใกล้แย",price:49000000,district:"บางกะปิ",province:"กรุงเทพมหานคร",raw_size:"359.1 ตารางวา",land_size_wah:359.1,land_size_sqm:1436.4,price_per_wah:136452},
-  {id:55,source:"kaidee",title:"ที่ดิน +โกดัง 101 ตร.ว. ที่ดิน +โกดัง อยู่หลังตลาดป้าพร",price:9999000,district:"สายไหม",province:"กรุงเทพมหานคร",raw_size:"101 ตารางวา",land_size_wah:101.0,land_size_sqm:404.0,price_per_wah:99000},
-  {id:56,source:"kaidee",title:"Phuwai hill resort",price:1600000,district:"ชะอำ",province:"เพชรบุรี",raw_size:"3 ไร่",land_size_wah:1200.0,land_size_sqm:4800.0,price_per_wah:1333},
-  {id:57,source:"kaidee",title:"ขายที่ดิน 1ไร่ 2งาน สายไหมวัดเกาะ ที่ดินเปล่าหรือพร้อมโ",price:17000000,district:"สายไหม",province:"กรุงเทพมหานคร",raw_size:"600 ตารางวา",land_size_wah:600.0,land_size_sqm:2400.0,price_per_wah:28333},
-  {id:58,source:"kaidee",title:"ขายที่ดินราคาถูก 393.9 ตารางวา คลองสาม คลองหลวง ปทุมธาน",price:3200000,district:"คลองหลวง",province:"ปทุมธานี",raw_size:"393.9 ตารางวา",land_size_wah:393.9,land_size_sqm:1575.6,price_per_wah:8124},
-  {id:59,source:"kaidee",title:"ที่ดินพร้อมสิ่งปลูกสร้าง 1 ไร่ 355 ตร.ว. ที่ดินพร้อมสิ่",price:9900000,district:"เมือง",province:"กาญจนบุรี",raw_size:"กาญจนบุรี1.355 ไร่",land_size_wah:542.0,land_size_sqm:2168.0,price_per_wah:18266},
-  {id:60,source:"kaidee",title:"ที่ดินแบ่งขาย",price:500000,district:"หนองแค",province:"สระบุรี",raw_size:"350 ตารางวา",land_size_wah:350.0,land_size_sqm:1400.0,price_per_wah:1429},
-  {id:61,source:"kaidee",title:"ขายที่ดินพร้อมสิ่งปลูกสร้าง 114 ตร.ว. ลาดพร้าว 15 ทำเลใ",price:35500000,district:"จตุจักร",province:"กรุงเทพมหานคร",raw_size:"114 ตารางวา",land_size_wah:114.0,land_size_sqm:456.0,price_per_wah:311404},
-  {id:62,source:"kaidee",title:"ขายด่วน ที่ดินสวย 98 ตร.ว. ราคา Net",price:800000,district:"คลองหลวง",province:"ปทุมธานี",raw_size:"98 ตารางวา",land_size_wah:98.0,land_size_sqm:392.0,price_per_wah:8163},
-  {id:63,source:"kaidee",title:"ที่ดิน พร้อมสิ่งปลูกสร้าง 35 ตร.ว. ที่ดิน พร้อมสิ่งปลูก",price:650000,district:"จอมทอง",province:"กรุงเทพมหานคร",raw_size:"35 ตารางวา",land_size_wah:35.0,land_size_sqm:140.0,price_per_wah:18571},
-  {id:64,source:"kaidee",title:"ขายที่ดินสุขุมวิท 52 เนื้อที่ 395 ตารางวา ที่ดินหัวมุม ",price:360000000,district:"พระโขนง",province:"กรุงเทพมหานคร",raw_size:"395 ตารางวา",land_size_wah:395.0,land_size_sqm:1580.0,price_per_wah:911392},
-  {id:65,source:"kaidee",title:"ขายที่ดินเชิงเขา 1งาน เหมาะปลูกบ้านพักตากอากาศ หรือรีสอ",price:350000,district:"แม่จัน",province:"เชียงราย",raw_size:"100 ตารางวา",land_size_wah:100.0,land_size_sqm:400.0,price_per_wah:3500},
-  {id:66,source:"kaidee",title:"ที่ดินเปล่า ปากช่อง 40 ไร่",price:231720000,district:"ปากช่อง",province:"นครราชสีมา",raw_size:"16204 ตารางวา",land_size_wah:16204.0,land_size_sqm:64816.0,price_per_wah:14300},
-  {id:67,source:"kaidee",title:"ขายที่ดิน ทำเลดี นาบัว อ.บางละมุง พัทยา พื้นที่ 3-2-44 ",price:25000000,district:"บางละมุง",province:"ชลบุรี",raw_size:"3 ไร่",land_size_wah:1200.0,land_size_sqm:4800.0,price_per_wah:20833},
-  {id:68,source:"kaidee",title:"ขายที่ดินสวย หลังโลตัสบางใหญ่ อำเภอบางกรวย เนื้อที่ 2-2",price:65000000,district:"บางกรวย",province:"นนทบุรี",raw_size:"1020 ตารางวา",land_size_wah:1020.0,land_size_sqm:4080.0,price_per_wah:63725},
-  {id:69,source:"kaidee",title:"ที่ดินเปล่าโฉนด หน้าติดถนนคอนกรีต ด้านหลังติดแม่น้ำบางป",price:3500000,district:"บ้านสร้าง",province:"ปราจีนบุรี",raw_size:"532",land_size_wah:532.0,land_size_sqm:2128.0,price_per_wah:6579},
-  {id:70,source:"kaidee",title:"ที่ดิน แถมสิ่งปลูกสร้าง 163 ตร.ว. ที่ดิน แถมสิ่งปลูกสร้",price:87650000,district:"วัฒนา",province:"กรุงเทพมหานคร",raw_size:"163 ตารางวา",land_size_wah:163.0,land_size_sqm:652.0,price_per_wah:537730},
-  {id:71,source:"ddproperty",title:"ที่ดินแปลงสวย ศรีราชา-วัดเขาแตงอ่อน ค่ายลูกเสือ ชลบุรี",price:4500000,district:"ศรีราชา",province:"ชลบุรี",raw_size:"1 ไร่ 98 ตร.วา",land_size_wah:498.0,land_size_sqm:1992.0,price_per_wah:9036},
-  {id:72,source:"ddproperty",title:"ขายที่ดินเปล่า หลักหก เมืองปทุม ใกล้สถานีรถไฟฟ้า ซอยเจร",price:3900000,district:"เมืองปทุมธานี",province:"ปทุมธานี",raw_size:"121 ตร.วา",land_size_wah:121.0,land_size_sqm:484.0,price_per_wah:32231},
-  {id:73,source:"ddproperty",title:"ขายที่ดินแปลงมุม ถมแล้ว ซอยประเสริฐมนูกิจ 46",price:9000000,district:"บึงกุ่ม",province:"กรุงเทพ",raw_size:"135 ตร.วา",land_size_wah:135.0,land_size_sqm:540.0,price_per_wah:66667},
-  {id:74,source:"ddproperty",title:"ขาย ที่ดินเพื่อการลงทุน",price:236327000,district:"สามพราน",province:"นครปฐม",raw_size:"23 ไร่ 1 งาน 41 ตร.วา",land_size_wah:9341.0,land_size_sqm:37364.0,price_per_wah:25300},
-  {id:75,source:"ddproperty",title:"ขายที่ดินพร้อมบ้านสไตล์รีสอร์ท ท่ามกลางสวนทุเรียน",price:22500000,district:"มะขาม",province:"จันทบุรี",raw_size:"11 ไร่ 7 ตร.วา",land_size_wah:4407.0,land_size_sqm:17628.0,price_per_wah:5106},
-  {id:76,source:"ddproperty",title:"ขายที่ดิน ติดทะเล ชะอำ บางเก่า หน้าติดทะเล 50 เมตร",price:108000000,district:"ชะอำ",province:"เพชรบุรี",raw_size:"3 ไร่",land_size_wah:1200.0,land_size_sqm:4800.0,price_per_wah:90000},
-  {id:77,source:"ddproperty",title:"ขายที่ดิน 91 ไร่ เขาใหญ่ ใกล้ InterCon สวอนเลค",price:500500000,district:"ปากช่อง",province:"นครราชสีมา",raw_size:"91 ไร่",land_size_wah:36400.0,land_size_sqm:145600.0,price_per_wah:13750},
-  {id:78,source:"ddproperty",title:"ที่ดิน เขาใหญ่ 41 ไร่ วิวสวยมาก ใกล้รร.อินเตอร์คอนฯ ทอส",price:225500000,district:"ปากช่อง",province:"นครราชสีมา",raw_size:"41 ไร่",land_size_wah:16400.0,land_size_sqm:65600.0,price_per_wah:13750},
-  {id:79,source:"ddproperty",title:"ที่ดินสวย ทำเลทองติดถนนใหญ่ ใกล้แหล่งชุมชน",price:62100000,district:"สอยดาว",province:"จันทบุรี",raw_size:"138 ไร่ 3 งาน 71 ตร.วา",land_size_wah:55571.0,land_size_sqm:222284.0,price_per_wah:1117},
-  {id:80,source:"ddproperty",title:"ที่ดินซอยเอแบค โคตรถูก ไม่ถึง 5 ล้าน/ไร่",price:9990000,district:"บางเสาธง",province:"สมุทรปราการ",raw_size:"2 ไร่",land_size_wah:800.0,land_size_sqm:3200.0,price_per_wah:12488},
-  {id:81,source:"ddproperty",title:"เหลือแปลงสุดท้ายซอยติวานนท์ 24 หน้ากว้างติดถนน ถมแล้ว",price:42000000,district:"เมืองนนทบุรี",province:"นนทบุรี",raw_size:"1 ไร่ 2 งาน",land_size_wah:600.0,land_size_sqm:2400.0,price_per_wah:70000},
-  {id:82,source:"ddproperty",title:"ขาย/ให้เช่า ที่ดินแปลงใหญ่ติดถนนพระราม 9 เนื้อที่ 7-2-8",price:1542500000,district:"ห้วยขวาง",province:"กรุงเทพ",raw_size:"7 ไร่ 2 งาน 85 ตร.วา",land_size_wah:3085.0,land_size_sqm:12340.0,price_per_wah:500000},
-  {id:83,source:"ddproperty",title:"ขายที่ดิน 78 ไร่ ติดถนนพหลโยธิน ใกล้มหาวิทยาลัยธรรมศาสต",price:1450000000,district:"คลองหลวง",province:"ปทุมธานี",raw_size:"78 ไร่ 10 ตร.วา",land_size_wah:31210.0,land_size_sqm:124840.0,price_per_wah:46459},
-  {id:84,source:"ddproperty",title:"ขายที่ดินเปล่า 1,940 ไร่ (แยกขาย 3 กลุ่ม) ติดถนนเพชรเกษ",price:4617973000,district:"ชะอำ",province:"เพชรบุรี",raw_size:"1940 ไร่ 1 งาน 14 ตร.วา",land_size_wah:776114.0,land_size_sqm:3104456.0,price_per_wah:5950},
-  {id:85,source:"ddproperty",title:"ขายที่ดินเปล่า 345 ตร.ว กฤษฎานคร 25 ถมแล้ว บรรยากาศดี",price:3277500,district:"มีนบุรี",province:"กรุงเทพ",raw_size:"345 ตร.วา",land_size_wah:345.0,land_size_sqm:1380.0,price_per_wah:9500},
-  {id:86,source:"ddproperty",title:"ขายที่ดิน 197 ตรว เพชรเกษม 58 ทำเลดี ใกล้ MRT ภาษีเจริญ",price:5614500,district:"ภาษีเจริญ",province:"กรุงเทพ",raw_size:"197 ตร.วา",land_size_wah:197.0,land_size_sqm:788.0,price_per_wah:28500},
-  {id:87,source:"ddproperty",title:"ขายที่ดิน 431 ตารางวา โชคชัย 4 แยก 12 ถนนลาดพร้าว",price:43100000,district:"ลาดพร้าว",province:"กรุงเทพ",raw_size:"1 ไร่ 31 ตร.วา",land_size_wah:431.0,land_size_sqm:1724.0,price_per_wah:100000},
-  {id:88,source:"ddproperty",title:"ขายที่ดินสวย 9-2-98 ไร่ ในชะอำ",price:9700000,district:"ชะอำ",province:"เพชรบุรี",raw_size:"9 ไร่ 2 งาน 28 ตร.วา",land_size_wah:3828.0,land_size_sqm:15312.0,price_per_wah:2534},
-  {id:89,source:"ddproperty",title:"ที่ดินติดสนามกอล์ฟสปริงฟิลด์ 1-2-0 ไร่ ติดถนน วิวเขา",price:2490000,district:"ชะอำ",province:"เพชรบุรี",raw_size:"1 ไร่ 2 งาน",land_size_wah:600.0,land_size_sqm:2400.0,price_per_wah:4150},
-  {id:90,source:"ddproperty",title:"ที่ดินริมอ่างเก็บน้ำ 2-0-8 ไร่ วิวธรรมชาติในสปริงฟิลด์ ",price:9500000,district:"ชะอำ",province:"เพชรบุรี",raw_size:"2 ไร่ 8 ตร.วา",land_size_wah:808.0,land_size_sqm:3232.0,price_per_wah:11757},
-  {id:91,source:"ddproperty",title:"2,000 ตร.ม. ที่ดินสำหรับขาย (Laz118654) Palm Hills Golf",price:7900000,district:"ชะอำ",province:"เพชรบุรี",raw_size:"1 ไร่ 1 งาน",land_size_wah:500.0,land_size_sqm:2000.0,price_per_wah:15800},
-  {id:92,source:"ddproperty",title:"ขายที่ดิน 48,224 ตร.ม. (Laz116577)",price:42196000,district:"หัวหิน",province:"ประจวบคีรีขันธ์",raw_size:"30 ไร่ 56 ตร.วา",land_size_wah:12056.0,land_size_sqm:48224.0,price_per_wah:3500},
-  {id:93,source:"ddproperty",title:"ขายที่ดิน 22,815 ตร.ม. (Laz146885)",price:142000000,district:"หัวหิน",province:"ประจวบคีรีขันธ์",raw_size:"14 ไร่ 1 งาน 4 ตร.วา",land_size_wah:5704.0,land_size_sqm:22816.0,price_per_wah:24895},
-  {id:94,source:"ddproperty",title:"ขายที่ดิน 1,600 ตร.ม. ใกล้หาดทรายน้อย (Laz117716)",price:5500000,district:"หัวหิน",province:"ประจวบคีรีขันธ์",raw_size:"400 ตร.วา",land_size_wah:400.0,land_size_sqm:1600.0,price_per_wah:13750},
-  {id:95,source:"ddproperty",title:"ขายที่ดินติดหาด 31,600 ตร.ม. (Laz113070)",price:41475000,district:"บางสะพานน้อย",province:"ประจวบคีรีขันธ์",raw_size:"19 ไร่ 3 งาน",land_size_wah:7900.0,land_size_sqm:31600.0,price_per_wah:5250},
-];
-// SEED ใช้ข้อมูลจริงจาก Kaidee + DDProperty
+// Demo data are invented; no real listings or deed/owner identifiers.
+const REAL_LANDS = fixtures.SYNTHETIC_LANDS;
 const SEED = REAL_LANDS.map(r => ({...r, price: String(r.price)}));
+const FEATURED_LANDS = REAL_LANDS.slice(0, 2).map(r => ({...r,id:`F${r.id}`,featured:true}));
 
-/* ── FEATURED LANDS — โฉนดยืนยันแล้ว 17 แปลง (ของเจ้าของแพลตฟอร์ม) ── */
-const FEATURED_LANDS = [
-  {id:"F01",source:"owner",featured:true,
-   title:"ที่ดินสากเหล็ก แปลง 1 — โฉนด 12760",
-   deed_no:"12760",land_no:"303",survey:"50411 6020",
-   district:"สากเหล็ก",province:"พิจิตร",tambon:"สากเหล็ก",
-   raw_size:"57.10 ตร.ว.",land_size_wah:57.1,land_size_sqm:228.4,
-   price:0,price_per_wah:0,owner:"นางสาวณัฐขยาน์ แสงงาม",
-   note:"ติดถนนสาธารณะ · โฉนดน.ส.4จ. · ยืนยันแล้ว"},
-  {id:"F02",source:"owner",featured:true,
-   title:"ที่ดินสากเหล็ก แปลง 2 — โฉนด 12759",
-   deed_no:"12759",land_no:"302",survey:"50411 6020",
-   district:"สากเหล็ก",province:"พิจิตร",tambon:"สากเหล็ก",
-   raw_size:"57 ตร.ว.",land_size_wah:57.0,land_size_sqm:228.0,
-   price:0,price_per_wah:0,owner:"นางสาวณัฐขยาน์ แสงงาม",
-   note:"ติดถนนสาธารณะ · โฉนดน.ส.4จ. · ยืนยันแล้ว"},
-  {id:"F03",source:"owner",featured:true,
-   title:"ที่ดินสากเหล็ก แปลง 3 — โฉนด 12761",
-   deed_no:"12761",land_no:"304",survey:"50411 6020",
-   district:"สากเหล็ก",province:"พิจิตร",tambon:"สากเหล็ก",
-   raw_size:"1 งาน 46.5 ตร.ว.",land_size_wah:146.5,land_size_sqm:586.0,
-   price:0,price_per_wah:0,owner:"นางสาวณัฐขยาน์ แสงงาม",
-   note:"โฉนดน.ส.4จ. · ยืนยันแล้ว"},
-  {id:"F04",source:"owner",featured:true,
-   title:"ที่ดินสากเหล็ก แปลง 4 — โฉนด 12762",
-   deed_no:"12762",land_no:"304",survey:"50411 6020",
-   district:"สากเหล็ก",province:"พิจิตร",tambon:"สากเหล็ก",
-   raw_size:"1 งาน 33 ตร.ว.",land_size_wah:133.0,land_size_sqm:532.0,
-   price:0,price_per_wah:0,owner:"นางสาวณัฐขยาน์ แสงงาม",
-   note:"โฉนดน.ส.4จ. · ยืนยันแล้ว"},
-  {id:"F05",source:"owner",featured:true,
-   title:"ที่ดินสากเหล็ก แปลง 5 — โฉนด 12758",
-   deed_no:"12758",land_no:"303",survey:"50411 6020",
-   district:"สากเหล็ก",province:"พิจิตร",tambon:"สากเหล็ก",
-   raw_size:"1 งาน 36.5 ตร.ว.",land_size_wah:136.5,land_size_sqm:546.0,
-   price:0,price_per_wah:0,owner:"นางสาวณัฐขยาน์ แสงงาม",
-   note:"โฉนดน.ส.4จ. · ยืนยันแล้ว"},
-  {id:"F06",source:"owner",featured:true,
-   title:"ที่ดินบางกระทุ่ม แปลง 6 — โฉนด 26465",
-   deed_no:"26465",land_no:"423",survey:"5042 II 5628",
-   district:"บางกระทุ่ม",province:"พิษณุโลก",tambon:"เนินกุ่ม",
-   raw_size:"25.1 ตร.ว.",land_size_wah:25.1,land_size_sqm:100.4,
-   price:0,price_per_wah:0,owner:"นางสุวรินทร์ แสงงาม",
-   note:"โฉนดน.ส.4จ. · ยืนยันแล้ว"},
-  {id:"F07",source:"owner",featured:true,
-   title:"ที่ดินบางกระทุ่ม แปลง 7 — โฉนด 26564",
-   deed_no:"26564",land_no:"422",survey:"5042 II 5628",
-   district:"บางกระทุ่ม",province:"พิษณุโลก",tambon:"เนินกุ่ม",
-   raw_size:"25 ตร.ว.",land_size_wah:25.0,land_size_sqm:100.0,
-   price:0,price_per_wah:0,owner:"นางสุวรินทร์ แสงงาม",
-   note:"โฉนดน.ส.4จ. · ยืนยันแล้ว"},
-  {id:"F08",source:"owner",featured:true,
-   title:"ที่ดินบางกระทุ่ม แปลง 8 — โฉนด 26562",
-   deed_no:"26562",land_no:"421",survey:"5042 II 5628",
-   district:"บางกระทุ่ม",province:"พิษณุโลก",tambon:"เนินกุ่ม",
-   raw_size:"25 ตร.ว.",land_size_wah:25.0,land_size_sqm:100.0,
-   price:0,price_per_wah:0,owner:"นางสุวรินทร์ แสงงาม",
-   note:"โฉนดน.ส.4จ. · ยืนยันแล้ว"},
-  {id:"F09",source:"owner",featured:true,
-   title:"ที่ดินบางกระทุ่ม แปลง 9 — โฉนด 26560",
-   deed_no:"26560",land_no:"419",survey:"5042 II 5628",
-   district:"บางกระทุ่ม",province:"พิษณุโลก",tambon:"เนินกุ่ม",
-   raw_size:"25 ตร.ว.",land_size_wah:25.0,land_size_sqm:100.0,
-   price:0,price_per_wah:0,owner:"นางสุวรินทร์ แสงงาม",
-   note:"โฉนดน.ส.4จ. · ยืนยันแล้ว"},
-  {id:"F10",source:"owner",featured:true,
-   title:"ที่ดินบางกระทุ่ม แปลง 10 — โฉนด 26562",
-   deed_no:"26562",land_no:"420",survey:"5042 II 5628",
-   district:"บางกระทุ่ม",province:"พิษณุโลก",tambon:"เนินกุ่ม",
-   raw_size:"25 ตร.ว.",land_size_wah:25.0,land_size_sqm:100.0,
-   price:0,price_per_wah:0,owner:"นางสุวรินทร์ แสงงาม",
-   note:"โฉนดน.ส.4จ. · ยืนยันแล้ว"},
-  {id:"F11",source:"owner",featured:true,
-   title:"ที่ดินบางกระทุ่ม แปลง 11 — โฉนด 26560",
-   deed_no:"26560",land_no:"418",survey:"5042 II 5628",
-   district:"บางกระทุ่ม",province:"พิษณุโลก",tambon:"เนินกุ่ม",
-   raw_size:"25 ตร.ว.",land_size_wah:25.0,land_size_sqm:100.0,
-   price:0,price_per_wah:0,owner:"นางสุวรินทร์ แสงงาม",
-   note:"โฉนดน.ส.4จ. · ยืนยันแล้ว"},
-  {id:"F12",source:"owner",featured:true,
-   title:"ที่ดินสากเหล็ก แปลงใหญ่ — โฉนด 12725",
-   deed_no:"12725",land_no:"2464",survey:"5041 I 6020",
-   district:"สากเหล็ก",province:"พิจิตร",tambon:"สากเหล็ก",
-   raw_size:"3 ไร่ 7.5 ตร.ว.",land_size_wah:1207.5,land_size_sqm:4830.0,
-   price:0,price_per_wah:0,owner:"นางสาวณัฐขยาน์ แสงงาม",
-   note:"ขนาดใหญ่ 3 ไร่เศษ · โฉนดน.ส.4จ. · ยืนยันแล้ว"},
-  {id:"F13",source:"owner",featured:true,
-   title:"ที่ดินสากเหล็ก — โฉนด 12724",
-   deed_no:"12724",land_no:"2467",survey:"5041 I 6020",
-   district:"สากเหล็ก",province:"พิจิตร",tambon:"สากเหล็ก",
-   raw_size:"1 ไร่ 3 งาน 4.5 ตร.ว.",land_size_wah:704.5,land_size_sqm:2818.0,
-   price:0,price_per_wah:0,owner:"นางสาวณัฐขยาน์ แสงงาม",
-   note:"โฉนดน.ส.4จ. · ยืนยันแล้ว"},
-  {id:"F14",source:"owner",featured:true,
-   title:"ที่ดินสากเหล็ก แปลง 14 — โฉนด 12764",
-   deed_no:"12764",land_no:"307",survey:"50411 6020",
-   district:"สากเหล็ก",province:"พิจิตร",tambon:"สากเหล็ก",
-   raw_size:"45.5 ตร.ว.",land_size_wah:45.5,land_size_sqm:182.0,
-   price:0,price_per_wah:0,owner:"นางสาวณัฐขยาน์ แสงงาม",
-   note:"โฉนดน.ส.4จ. · ยืนยันแล้ว"},
-  {id:"F15",source:"owner",featured:true,
-   title:"ที่ดินสากเหล็ก แปลง 15 — โฉนด 12763",
-   deed_no:"12763",land_no:"306",survey:"50411 6020",
-   district:"สากเหล็ก",province:"พิจิตร",tambon:"สากเหล็ก",
-   raw_size:"43 ตร.ว.",land_size_wah:43.0,land_size_sqm:172.0,
-   price:0,price_per_wah:0,owner:"นางสาวณัฐขยาน์ แสงงาม",
-   note:"โฉนดน.ส.4จ. · ยืนยันแล้ว"},
-  {id:"F16",source:"owner",featured:true,
-   title:"ที่ดินสากเหล็ก — โฉนด 12725 แปลง 16",
-   deed_no:"12725",land_no:"2464",survey:"5041 I 6020",
-   district:"สากเหล็ก",province:"พิจิตร",tambon:"สากเหล็ก",
-   raw_size:"1 ไร่ 16.5 ตร.ว.",land_size_wah:416.5,land_size_sqm:1666.0,
-   price:0,price_per_wah:0,owner:"นางสาวณัฐขยาน์ แสงงาม",
-   note:"โฉนดน.ส.4จ. · ยืนยันแล้ว"},
-  {id:"F17",source:"owner",featured:true,
-   title:"ที่ดินบางบัวทอง นนทบุรี — โฉนด 11495",
-   deed_no:"11495",land_no:"6ส4",survey:"99 5136 III 2014-5",
-   district:"บางบัวทอง",province:"นนทบุรี",tambon:"บางบัวทอง",
-   raw_size:"66 ตร.ว.",land_size_wah:66.0,land_size_sqm:264.0,
-   price:0,price_per_wah:0,owner:"นางวรวรม ปฐมวิรุจน์",
-   note:"ใกล้เมือง ปริมณฑล · โฉนดน.ส.4จ. · ยืนยันแล้ว"},
-];
 
 
 /* ── Global Styles ── */
@@ -1243,8 +990,8 @@ function CreditPackageModal({ onClose, onBuy, currentPlanId="free" }) {
 
 /* ── AI Key Summary Card (แทน Chatbot) ── */
 function AISummaryCard({ land, zone, roi }) {
-  const bestType = roi?.Type_C_ROI ? "C (Low-Rise)" :
-                   (roi?.Type_A_ROI||0)>(roi?.Type_B_ROI||0) ? "A (บ้านหรู)" : "B (บ้านเช่า)";
+  const ranked = [["A (บ้านหรู)",roi?.Type_A_ROI],["B (บ้านเช่า)",roi?.Type_B_ROI],["C (Low-Rise)",roi?.Type_C_ROI]].filter(([,value])=>Number.isFinite(value)).sort((a,b)=>b[1]-a[1]);
+  const bestType = ranked[0]?.[0] || "ยังประเมินไม่ได้";
   const bestRoi  = Math.max(roi?.Type_A_ROI||0, roi?.Type_B_ROI||0, roi?.Type_C_ROI||0);
   const gfa      = roi?.GFA_Max || 0;
   const flag     = zone?.road_width_m < 8 ? "⚠ ถนน < 8 ม. — ไม่รองรับ Type C" : null;
@@ -2855,14 +2602,15 @@ export default function App() {
     }
     let active = true;
     (async () => {
-      const [{ data: sub }, { data: usage }] = await Promise.all([
-        supabase.from("subscriptions").select("plan_id,status").eq("user_id", user.id).maybeSingle(),
-        supabase.from("usage_cycles").select("credits_remaining,reports_remaining").eq("user_id", user.id).maybeSingle(),
-      ]);
-      if (!active) return;
-      setPlan(sub?.plan_id || "free");
-      setCredits(usage?.credits_remaining ?? planById(sub?.plan_id || "free").monthlyCredits);
-      setReportsLeft(usage?.reports_remaining ?? planById(sub?.plan_id || "free").reportsIncluded);
+      try {
+        const state = await authService.loadEntitlements(supabase, user.id);
+        if (!active) return;
+        setPlan(state.plan); setCredits(state.credits); setReportsLeft(state.reports);
+      } catch {
+        if (!active) return;
+        setPlan("free"); setCredits(0); setReportsLeft(0);
+        showToast("โหลดสิทธิ์ไม่สำเร็จ กรุณาลองใหม่ — ยังไม่เปิดสิทธิ์รายงาน");
+      }
     })();
     return () => { active = false; };
   }, [user]);
@@ -2949,6 +2697,7 @@ export default function App() {
   return (
     <>
       <GlobalStyles/>
+      <div style={{padding:8,textAlign:"center",background:"#FFF0E0",fontSize:12}}>ข้อมูลจำลองสำหรับทดสอบ — ไม่ใช่ประกาศขายหรือผลยืนยันทางกฎหมาย</div>
 
       <Navbar
         screen={screen}
@@ -3151,10 +2900,7 @@ function ReportScreen({ onToast, plan="free", reportsLeft=0, onUseReport, onOpen
     if (!form.location || !form.size) {
       onToast("กรุณากรอกทำเลและขนาดที่ดินก่อน"); return;
     }
-    if (onUseReport) {
-      const ok = await onUseReport();
-      if (ok === false) return; // เครดิตรายงานหมดไปแล้วระหว่างทาง (race condition) — หยุดที่นี่
-    }
+    // Quota reservation/commit will be wired only after sandbox authorization tests.
     setStep(2); setLoading(true);
 
     const prompt = `สร้างรายงาน Feasibility Study เต็มรูปแบบสำหรับที่ดินต่อไปนี้:
@@ -3171,8 +2917,8 @@ function ReportScreen({ onToast, plan="free", reportsLeft=0, onUseReport, onOpen
 - หมายเหตุ: ${form.note || "-"}
 
 ROI ที่คำนวณได้:
-- Type A (บ้านหรู): ${roi?.Type_A_ROI?.toFixed(1)}% ต่อปี
-- Type B (บ้านเช่า): ${roi?.Type_B_ROI?.toFixed(1)}% ต่อปี  
+- Type A (บ้านหรู): ${roi?.Type_A_ROI?.toFixed(1)}% กำไรต่อเงินลงทุนทั้งโครงการ (ไม่ใช่ต่อปี)
+- Type B (บ้านเช่า, ผลตอบแทนรวมก่อนค่าใช้จ่าย): ${roi?.Type_B_ROI?.toFixed(1)}% ต่อปี
 - Type C (Low-Rise): ${roi?.Type_C_ROI ? roi.Type_C_ROI.toFixed(1)+"%": roi?.Type_C_Block || "N/A"}
 
 กรุณาสร้างรายงานเป็นภาษาไทยในรูปแบบ JSON ต่อไปนี้ (ตอบเป็น JSON เท่านั้น ไม่ต้องมี markdown):
@@ -3190,18 +2936,7 @@ ROI ที่คำนวณได้:
 }`;
 
     try {
-      const res = await fetch("https://api.anthropic.com/v1/messages", {
-        method:"POST",
-        headers:{"Content-Type":"application/json"},
-        body: JSON.stringify({
-          model:"claude-sonnet-4-6", max_tokens:1000,
-          messages:[{role:"user", content:prompt}]
-        })
-      });
-      const data = await res.json();
-      const text = data.content?.[0]?.text || "{}";
-      const clean = text.replace(/```json|```/g,"").trim();
-      const parsed_report = JSON.parse(clean);
+      const parsed_report = await requestAI("report", { prompt });
       setReport(parsed_report);
       setStep(3);
     } catch(e) {
@@ -3600,6 +3335,7 @@ function IntakeScreen({ onToast }) {
   function handleFile(e) {
     const f = e.target.files[0];
     if (!f) return;
+    if (!intakeDomain.validateImage(f)) { onToast("รองรับ JPEG/PNG ขนาดไม่เกิน 30 KB สำหรับ sandbox"); return; }
     setImg(f);
     const reader = new FileReader();
     reader.onload = ev => {
@@ -3614,43 +3350,7 @@ function IntakeScreen({ onToast }) {
     setLoading(true); setResult(null);
 
     try {
-      const res = await fetch("https://api.anthropic.com/v1/messages", {
-        method:"POST",
-        headers:{"Content-Type":"application/json"},
-        body: JSON.stringify({
-          model:"claude-sonnet-4-6", max_tokens:1000,
-          messages:[{
-            role:"user",
-            content:[
-              {type:"image", source:{type:"base64", media_type:img.type||"image/jpeg", data:imgBase64}},
-              {type:"text", text:`คุณคือระบบ OCR เฉพาะทางสำหรับโฉนดที่ดินไทย
-
-กรุณาสกัดข้อมูลจากรูปโฉนดหรือเอกสารที่ดินที่เห็น แล้วตอบเป็น JSON เท่านั้น:
-{
-  "deed_type": "โฉนดที่ดิน/น.ส.3/ส.ค.1/อื่นๆ หรือ 'ไม่ใช่โฉนด' ถ้าไม่ใช่เอกสารที่ดิน",
-  "deed_number": "เลขที่โฉนด หรือ null",
-  "title_deed_no": "เลขที่ดิน หรือ null",
-  "area_rai": ตัวเลขไร่ หรือ null,
-  "area_ngan": ตัวเลขงาน หรือ null,
-  "area_wah": ตัวเลขตารางวา หรือ null,
-  "area_sqm": ตัวเลขตารางเมตร หรือ null,
-  "province": "จังหวัด หรือ null",
-  "district": "อำเภอ/เขต หรือ null",
-  "subdistrict": "ตำบล/แขวง หรือ null",
-  "owner_name": "ชื่อเจ้าของ หรือ null",
-  "map_sheet": "ระวางที่ หรือ null",
-  "ocr_confidence": 0.0 ถึง 1.0 (ความมั่นใจในการอ่าน),
-  "notes": "สิ่งที่อ่านไม่ชัดหรือข้อสังเกต",
-  "road_access_visible": true/false หรือ null
-}`}
-            ]
-          }]
-        })
-      });
-      const data = await res.json();
-      const text = data.content?.[0]?.text || "{}";
-      const clean = text.replace(/```json|```/g,"").trim();
-      const parsed = JSON.parse(clean);
+      const parsed = await requestAI("ocr", { image: { mediaType: img.type, base64: imgBase64 } });
       setResult(parsed);
       setConfidence(parsed.ocr_confidence || 0);
     } catch(e) {
@@ -3660,37 +3360,11 @@ function IntakeScreen({ onToast }) {
   }
 
   async function analyzeGPS() {
-    if (!gps.lat || !gps.lng) { onToast("กรุณาระบุพิกัด GPS"); return; }
+    if (!intakeDomain.validateGPS(gps)) { onToast("กรุณาระบุพิกัด GPS"); return; }
     setLoading(true); setResult(null);
 
     try {
-      const res = await fetch("https://api.anthropic.com/v1/messages", {
-        method:"POST",
-        headers:{"Content-Type":"application/json"},
-        body: JSON.stringify({
-          model:"claude-sonnet-4-6", max_tokens:1000,
-          messages:[{role:"user", content:`ที่ดินมีพิกัด GPS: lat=${gps.lat}, lng=${gps.lng}
-ขนาดโดยประมาณ: ${gps.area || "ไม่ทราบ"} ตร.ว.
-
-กรุณาวิเคราะห์ตำแหน่งและประเมินข้อมูลเบื้องต้น ตอบเป็น JSON เท่านั้น:
-{
-  "estimated_location": "คำอธิบายตำแหน่งโดยประมาณในประเทศไทย",
-  "probable_province": "จังหวัดที่น่าจะเป็น",
-  "probable_district": "เขต/อำเภอที่น่าจะเป็น",
-  "area_sqm": ${gps.area ? parseFloat(gps.area)*4 : null},
-  "area_wah": ${gps.area || null},
-  "estimation_method": "gps_pin_estimate",
-  "ocr_confidence": 0.5,
-  "road_access_visible": null,
-  "notes": "ข้อมูลนี้เป็นการประมาณจาก GPS เท่านั้น ต้องยืนยันกับโฉนดจริง",
-  "flags": ["low_confidence_area", "requires_deed_verification"]
-}`}]
-        })
-      });
-      const data = await res.json();
-      const text = data.content?.[0]?.text || "{}";
-      const clean = text.replace(/```json|```/g,"").trim();
-      const parsed = JSON.parse(clean);
+      const parsed = await requestAI("gps", { lat: Number(gps.lat), lng: Number(gps.lng), areaWah: gps.area ? Number(gps.area) : null });
       setResult(parsed);
       setConfidence(0.5);
     } catch(e) {
@@ -3741,7 +3415,7 @@ function IntakeScreen({ onToast }) {
               <button onClick={()=>{setMode(null);setResult(null);setImg(null);setImgBase64(null);}}
                 style={{fontSize:12,color:C.mist,background:"none",border:"none",cursor:"pointer"}}>← เปลี่ยนวิธี</button>
             </div>
-            <input ref={fileRef} type="file" accept="image/*,.pdf" onChange={handleFile} style={{display:"none"}}/>
+            <input ref={fileRef} type="file" accept="image/jpeg,image/png" onChange={handleFile} style={{display:"none"}}/>
             <div onClick={()=>fileRef.current.click()} style={{
               border:`2px dashed ${img?C.forest:C.sand}`,borderRadius:12,padding:"32px",
               textAlign:"center",cursor:"pointer",background:img?"#EAF2EC":C.cream,marginBottom:16,transition:"all .2s"}}
