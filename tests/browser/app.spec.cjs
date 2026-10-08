@@ -16,6 +16,12 @@ test('guest homepage hydrates at mobile width',async({page})=>{
 test('AI endpoint rejects anonymous and forged identity in actual browser request',async({request})=>{
   for(const headers of [{},{Authorization:'Bearer forged-synthetic'}]){const res=await request.post('/api/ai',{headers,data:{task:'report',payload:{prompt:'synthetic'}}});expect(res.status()).toBe(401);expect((await res.json()).error.code).toBe('UNAUTHENTICATED')}
 });
+test('job API rejects anonymous/forged create and status reads without binding',async({request})=>{
+  for(const headers of [{},{Authorization:'Bearer forged-synthetic'}]){
+    const created=await request.post('/api/ai/jobs',{headers,data:{task:'gps',payload:{lat:0,lng:0,areaWah:100}}});expect(created.status()).toBe(401);
+    const read=await request.get('/api/ai/jobs?id=synthetic-not-a-job',{headers});expect(read.status()).toBe(401);
+  }
+});
 async function openGPS(page){
   await page.route('**/*',route=>new URL(route.request().url()).hostname==='127.0.0.1'?route.continue():route.abort());
   await page.goto('/');await page.getByText('📄 นำเข้าที่ดิน',{exact:true}).click();
